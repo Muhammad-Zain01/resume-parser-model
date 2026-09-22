@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from pypdf import PdfReader
+from tqdm import tqdm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -39,10 +41,14 @@ class ResumeTextExtractor:
         raw_dir: Path | None = None,
         extracted_dir: Path | None = None,
         overwrite: bool = False,
+        workers: int = 8,
     ) -> None:
         self.raw_dir = raw_dir or self._default_raw_dir()
         self.extracted_dir = extracted_dir or DATA_DIR / "extracted"
         self.overwrite = overwrite
+        if workers < 1:
+            raise ValueError("workers must be at least 1")
+        self.workers = workers
 
     @staticmethod
     def _default_raw_dir() -> Path:
@@ -120,7 +126,17 @@ class ResumeTextExtractor:
 
     def run(self) -> list[ExtractionRecord]:
         """Process all PDFs and return extraction results."""
-        return [self._process_pdf(path) for path in self.find_pdfs()]
+        pdf_paths = self.find_pdfs()
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            results = executor.map(self._process_pdf, pdf_paths)
+            return list(
+                tqdm(
+                    results,
+                    total=len(pdf_paths),
+                    desc=f"Extracting resumes ({self.workers} workers)",
+                    unit="pdf",
+                )
+            )
 
     def find_image_based_texts(self) -> list[Path]:
         """Return text files that still contain the image-based marker."""
@@ -143,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         help="Replace existing text files; do not use after OCR without a backup.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of parallel PDF workers (default: 8).",
+    )
+    parser.add_argument(
         "--list-image-based",
         action="store_true",
         help="List text files containing [IMAGE_BASED] without extracting PDFs.",
@@ -156,6 +178,7 @@ def main() -> int:
         raw_dir=args.raw_dir,
         extracted_dir=args.extracted_dir,
         overwrite=args.overwrite,
+        workers=args.workers,
     )
 
     if args.list_image_based:
