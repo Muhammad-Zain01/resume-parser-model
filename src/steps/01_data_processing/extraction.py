@@ -9,6 +9,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 import unicodedata
+import zipfile
 
 from docx import Document
 from pypdf import PdfReader
@@ -51,6 +52,9 @@ class ExtractionResult:
 def clean_extracted_text(text: str) -> str:
     """Apply safe cleanup while preserving resume structure and punctuation."""
     normalized = unicodedata.normalize("NFKC", text)
+    # Some PDF fonts produce lone UTF-16 surrogate characters. Replace those
+    # before writing UTF-8 text files so one malformed glyph cannot fail a job.
+    normalized = normalized.encode("utf-8", errors="replace").decode("utf-8")
     normalized = normalized.replace("\u00a0", " ")
     normalized = re.sub(r"[\u200b-\u200d\ufeff]", "", normalized)
     normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
@@ -103,12 +107,36 @@ def _extract_docx(path: Path) -> ExtractionResult:
     )
 
 
-def extract_document(path: Path) -> ExtractionResult:
-    """Extract and safely clean one PDF or DOCX document."""
+def _detect_file_type(path: Path) -> str:
+    """Detect PDF/DOCX by file signature, including mislabeled DOCX files."""
+    with path.open("rb") as handle:
+        signature = handle.read(8)
+
+    if signature.startswith(b"%PDF"):
+        return "PDF"
+
+    if signature.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(path) as archive:
+                if "word/document.xml" in archive.namelist():
+                    return "DOCX"
+        except zipfile.BadZipFile:
+            pass
+
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        return _extract_pdf(path)
+        return "PDF"
     if suffix == ".docx":
+        return "DOCX"
+    raise ValueError(f"Unsupported document type: {path.suffix}")
+
+
+def extract_document(path: Path) -> ExtractionResult:
+    """Extract and safely clean one PDF or DOCX document."""
+    file_type = _detect_file_type(path)
+    if file_type == "PDF":
+        return _extract_pdf(path)
+    if file_type == "DOCX":
         return _extract_docx(path)
     raise ValueError(f"Unsupported document type: {path.suffix}")
 
