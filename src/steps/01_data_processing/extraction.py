@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract selectable PDF text and mark image-based resumes for later OCR."""
+"""Extract PDF/DOCX text and mark image-based resumes for later OCR."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 import re
 from dataclasses import dataclass
 from pathlib import Path
+import unicodedata
 
+from docx import Document
 from pypdf import PdfReader
 from tqdm import tqdm
 
@@ -16,6 +18,7 @@ from tqdm import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DATA_DIR = PROJECT_ROOT / ".data"
 IMAGE_BASED_MARKER = "[IMAGE_BASED]"
+NO_TEXT_MARKER = "[NO_TEXT]"
 EXTRACTION_FAILED_MARKER = "[EXTRACTION_FAILED]"
 
 
@@ -25,12 +28,89 @@ class ExtractionRecord:
 
     resume_id: str
     category: str
+    file_type: str
     raw_path: str
     extracted_path: str
     extraction_status: str
     page_count: int
     character_count: int
     extraction_error: str = ""
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    """Normalized result returned by the single document extractor."""
+
+    text: str
+    file_type: str
+    status: str
+    page_count: int = 0
+    image_count: int = 0
+
+
+def clean_extracted_text(text: str) -> str:
+    """Apply safe cleanup while preserving resume structure and punctuation."""
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = normalized.replace("\u00a0", " ")
+    normalized = re.sub(r"[\u200b-\u200d\ufeff]", "", normalized)
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in normalized.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _extract_pdf(path: Path) -> ExtractionResult:
+    reader = PdfReader(str(path))
+    pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    text = clean_extracted_text("\n\n".join(page for page in pages if page))
+    status = "TEXT_EXTRACTED" if text else "IMAGE_BASED"
+    return ExtractionResult(
+        text=text,
+        file_type="PDF",
+        status=status,
+        page_count=len(reader.pages),
+    )
+
+
+def _extract_docx(path: Path) -> ExtractionResult:
+    document = Document(str(path))
+    parts = [paragraph.text for paragraph in document.paragraphs]
+
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                parts.append(" | ".join(cells))
+
+    for section in document.sections:
+        parts.extend(paragraph.text for paragraph in section.header.paragraphs)
+        parts.extend(paragraph.text for paragraph in section.footer.paragraphs)
+
+    text = clean_extracted_text("\n".join(parts))
+    image_count = len(document.inline_shapes)
+    if text:
+        status = "TEXT_EXTRACTED"
+    elif image_count:
+        status = "IMAGE_BASED"
+    else:
+        status = "NO_TEXT"
+
+    return ExtractionResult(
+        text=text,
+        file_type="DOCX",
+        status=status,
+        image_count=image_count,
+    )
+
+
+def extract_document(path: Path) -> ExtractionResult:
+    """Extract and safely clean one PDF or DOCX document."""
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_pdf(path)
+    if suffix == ".docx":
+        return _extract_docx(path)
+    raise ValueError(f"Unsupported document type: {path.suffix}")
 
 
 class ResumeTextExtractor:
@@ -56,30 +136,22 @@ class ResumeTextExtractor:
         raw_dir = DATA_DIR / "raw"
         return raw_dir if raw_dir.is_dir() else DATA_DIR / "pdf"
 
-    def find_pdfs(self) -> list[Path]:
+    def find_documents(self) -> list[Path]:
         if not self.raw_dir.is_dir():
             raise FileNotFoundError(f"Raw resume directory does not exist: {self.raw_dir}")
         return sorted(
             path
             for path in self.raw_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() == ".pdf"
+            if path.is_file() and path.suffix.lower() in {".pdf", ".docx"}
         )
 
-    def _category_for(self, pdf_path: Path) -> str:
-        parent = pdf_path.relative_to(self.raw_dir).parent
+    def _category_for(self, document_path: Path) -> str:
+        parent = document_path.relative_to(self.raw_dir).parent
         return str(parent) if str(parent) != "." else "Uncategorized"
 
-    def _text_path_for(self, pdf_path: Path) -> Path:
-        relative_path = pdf_path.relative_to(self.raw_dir).with_suffix(".txt")
+    def _text_path_for(self, document_path: Path) -> Path:
+        relative_path = document_path.relative_to(self.raw_dir).with_suffix(".txt")
         return self.extracted_dir / relative_path
-
-    @staticmethod
-    def _extract(pdf_path: Path) -> tuple[str, int, str]:
-        reader = PdfReader(str(pdf_path))
-        pages = [(page.extract_text() or "").strip() for page in reader.pages]
-        text = "\n\n".join(page for page in pages if page)
-        status = "TEXT_EXTRACTED" if re.search(r"\S", text) else "IMAGE_BASED"
-        return text, len(reader.pages), status
 
     @staticmethod
     def _relative_path(path: Path) -> str:
@@ -90,33 +162,41 @@ class ResumeTextExtractor:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    def _process_pdf(self, pdf_path: Path) -> ExtractionRecord:
-        text_path = self._text_path_for(pdf_path)
-        category = self._category_for(pdf_path)
+    def _process_document(self, document_path: Path) -> ExtractionRecord:
+        text_path = self._text_path_for(document_path)
+        category = self._category_for(document_path)
 
         try:
-            text, page_count, status = self._extract(pdf_path)
+            result = extract_document(document_path)
 
             # Existing files are preserved so a future OCR result is not lost.
             if not text_path.exists() or self.overwrite:
-                self._write_text(text_path, text or IMAGE_BASED_MARKER)
+                if result.text:
+                    content = result.text
+                elif result.status == "IMAGE_BASED":
+                    content = IMAGE_BASED_MARKER
+                else:
+                    content = NO_TEXT_MARKER
+                self._write_text(text_path, content)
 
             current_text = text_path.read_text(encoding="utf-8", errors="replace")
             return ExtractionRecord(
-                resume_id=pdf_path.stem,
+                resume_id=document_path.stem,
                 category=category,
-                raw_path=self._relative_path(pdf_path),
+                file_type=result.file_type,
+                raw_path=self._relative_path(document_path),
                 extracted_path=self._relative_path(text_path),
-                extraction_status=status,
-                page_count=page_count,
+                extraction_status=result.status,
+                page_count=result.page_count,
                 character_count=len(current_text),
             )
-        except Exception as error:  # Continue processing if one PDF is damaged.
+        except Exception as error:  # Continue processing if one document is damaged.
             self._write_text(text_path, EXTRACTION_FAILED_MARKER)
             return ExtractionRecord(
-                resume_id=pdf_path.stem,
+                resume_id=document_path.stem,
                 category=category,
-                raw_path=self._relative_path(pdf_path),
+                file_type=document_path.suffix.lower().lstrip(".").upper(),
+                raw_path=self._relative_path(document_path),
                 extracted_path=self._relative_path(text_path),
                 extraction_status="EXTRACTION_FAILED",
                 page_count=0,
@@ -125,16 +205,16 @@ class ResumeTextExtractor:
             )
 
     def run(self) -> list[ExtractionRecord]:
-        """Process all PDFs and return extraction results."""
-        pdf_paths = self.find_pdfs()
+        """Process all supported documents and return extraction results."""
+        document_paths = self.find_documents()
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            results = executor.map(self._process_pdf, pdf_paths)
+            results = executor.map(self._process_document, document_paths)
             return list(
                 tqdm(
                     results,
-                    total=len(pdf_paths),
+                    total=len(document_paths),
                     desc=f"Extracting resumes ({self.workers} workers)",
-                    unit="pdf",
+                    unit="document",
                 )
             )
 
@@ -162,7 +242,7 @@ def parse_args() -> argparse.Namespace:
         "--workers",
         type=int,
         default=8,
-        help="Number of parallel PDF workers (default: 8).",
+        help="Number of parallel document workers (default: 8).",
     )
     parser.add_argument(
         "--list-image-based",
@@ -192,7 +272,10 @@ def main() -> int:
     counts: dict[str, int] = {}
     for record in records:
         counts[record.extraction_status] = counts.get(record.extraction_status, 0) + 1
-    print(f"Processed PDFs: {len(records)}")
+    print(f"Processed documents: {len(records)}")
+    file_types = {record.file_type for record in records}
+    for file_type in sorted(file_types):
+        print(f"{file_type}: {sum(record.file_type == file_type for record in records)}")
     for status, count in sorted(counts.items()):
         print(f"{status}: {count}")
     return 0
