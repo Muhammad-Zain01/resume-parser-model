@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
 import random
@@ -52,7 +52,13 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "low", "medium", "high", "xhigh", "max"),
         default="low",
     )
-    parser.add_argument("--workers", type=int, default=3)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="Maximum seconds allowed for one Codex request (default: 180).",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -107,7 +113,13 @@ def _render_pdf(pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
     return pages
 
 
-def _run_codex(images: list[Path], prompt: str, model: str, reasoning_effort: str) -> str:
+def _run_codex(
+    images: list[Path],
+    prompt: str,
+    model: str,
+    reasoning_effort: str,
+    timeout_seconds: int,
+) -> str:
     with tempfile.NamedTemporaryFile(prefix="codex-output-", suffix=".txt", delete=False) as handle:
         output_path = Path(handle.name)
 
@@ -132,7 +144,13 @@ def _run_codex(images: list[Path], prompt: str, model: str, reasoning_effort: st
         # can otherwise consume a following positional prompt on some CLI builds.
         command.append("-")
 
-        result = subprocess.run(command, input=prompt, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise VisionExtractionError(f"Codex failed: {detail[-1000:]}")
@@ -155,6 +173,7 @@ def _process_one(
     model: str,
     reasoning_effort: str,
     dpi: int,
+    timeout_seconds: int,
     overwrite: bool,
 ) -> dict[str, object]:
     started = time.perf_counter()
@@ -178,7 +197,13 @@ def _process_one(
         with tempfile.TemporaryDirectory(prefix=f"vision-{txt_path.stem}-") as temp_dir:
             images = _render_pdf(pdf_path, Path(temp_dir), dpi)
             record["page_count"] = len(images)
-            text = _run_codex(images, EXTRACTION_PROMPT, model, reasoning_effort)
+            text = _run_codex(
+                images,
+                EXTRACTION_PROMPT,
+                model,
+                reasoning_effort,
+                timeout_seconds,
+            )
 
         # Replace the marker only after a successful, non-empty extraction.
         txt_path.write_text(text + "\n", encoding="utf-8")
@@ -237,12 +262,18 @@ def main() -> int:
                 args.model,
                 args.reasoning_effort,
                 args.dpi,
+                args.timeout,
                 args.overwrite,
             )
             for path in candidates
         ]
         records = []
-        for job in tqdm(jobs, desc=f"Codex vision ({args.workers} workers)", unit="resume"):
+        for job in tqdm(
+            as_completed(jobs),
+            total=len(jobs),
+            desc=f"Codex vision ({args.workers} workers)",
+            unit="resume",
+        ):
             record = job.result()
             records.append(record)
             with args.log_file.open("a", encoding="utf-8") as log_handle:
