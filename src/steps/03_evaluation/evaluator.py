@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Callback-driven resume JSON evaluation using Jev as the semantic judge."""
+"""Hybrid evaluation for structured resume extraction."""
 
 from __future__ import annotations
 
-from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import Counter, defaultdict, deque
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
 import random
+import re
 import sys
 import time
+import unicodedata
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
@@ -33,183 +35,53 @@ from src.schema.resume_output import ResumeOutput
 DATA_DIR = PROJECT_ROOT / ".data"
 DEFAULT_PROMPT_PATH = Path(__file__).with_name("evaluation_prompt.md")
 
+# These fields need meaning comparison when normalized exact comparison differs.
+SEMANTIC_FIELDS = {
+    "professional_title",
+    "professional_summary",
+    "career_objective",
+    "target_roles",
+    "job_title",
+    "degree",
+    "field_of_study",
+    "description",
+    "responsibilities",
+    "achievements",
+    "role",
+    "proficiency",
+    "relationship",
+    "content",
+    "technical",
+    "tools_and_software",
+    "domain",
+    "soft",
+}
 
-def _build_schema_questions() -> tuple[dict[str, Any], ...]:
-    """Create one Jev check per ResumeOutput leaf, including nested records."""
-    scalar_fields = [
-        "personal_information.full_name",
-        "personal_information.professional_title",
-        "personal_information.email",
-        "personal_information.address",
-        "personal_information.city",
-        "personal_information.state_or_region",
-        "personal_information.postal_code",
-        "personal_information.country",
-        "personal_information.linkedin",
-        "personal_information.portfolio",
-        "professional_summary",
-        "career_objective",
-        "work_experience[*].job_title",
-        "work_experience[*].company",
-        "work_experience[*].location",
-        "work_experience[*].employment_type",
-        "work_experience[*].start_date",
-        "work_experience[*].end_date",
-        "work_experience[*].is_current",
-        "work_experience[*].description",
-        "education[*].institution",
-        "education[*].degree",
-        "education[*].field_of_study",
-        "education[*].location",
-        "education[*].start_date",
-        "education[*].end_date",
-        "education[*].graduation_date",
-        "education[*].gpa",
-        "certifications[*].name",
-        "certifications[*].type",
-        "certifications[*].issuer",
-        "certifications[*].issue_date",
-        "certifications[*].expiry_date",
-        "certifications[*].credential_id",
-        "certifications[*].description",
-        "projects[*].name",
-        "projects[*].role",
-        "projects[*].description",
-        "projects[*].start_date",
-        "projects[*].end_date",
-        "projects[*].url",
-        "awards_and_honors[*].name",
-        "awards_and_honors[*].issuer",
-        "awards_and_honors[*].date",
-        "awards_and_honors[*].description",
-        "publications[*].title",
-        "publications[*].publisher",
-        "publications[*].date",
-        "publications[*].url",
-        "volunteer_experience[*].organization",
-        "volunteer_experience[*].role",
-        "volunteer_experience[*].start_date",
-        "volunteer_experience[*].end_date",
-        "volunteer_experience[*].description",
-        "professional_memberships[*].organization",
-        "professional_memberships[*].role",
-        "professional_memberships[*].date",
-        "references[*].name",
-        "references[*].relationship",
-        "references[*].company",
-        "references[*].contact",
-        "additional_sections[*].section_name",
-        "additional_sections[*].content",
-    ]
-    unordered_lists = [
-        "personal_information.phone_numbers",
-        "personal_information.other_links",
-        "target_roles",
-        "skills.technical",
-        "skills.tools_and_software",
-        "skills.domain",
-        "skills.soft",
-        "work_experience[*].responsibilities",
-        "work_experience[*].achievements",
-        "work_experience[*].skills_used",
-        "education[*].honors",
-        "projects[*].technologies",
-    ]
-    record_keys = {
-        "skills.spoken_languages": "language",
-        "work_experience": "job_title, company, and dates",
-        "education": "institution, degree, and dates",
-        "certifications": "name and issuer",
-        "projects": "name and role",
-        "awards_and_honors": "name and issuer",
-        "publications": "title and publisher",
-        "volunteer_experience": "organization and role",
-        "professional_memberships": "organization and role",
-        "references": "name and company",
-        "additional_sections": "section_name",
-    }
-    scalar_fields.extend((
-        "skills.spoken_languages[*].language",
-        "skills.spoken_languages[*].proficiency",
-    ))
+# Stable keys align records without relying on their array order.
+RECORD_KEYS: dict[str, tuple[str, ...]] = {
+    "skills.spoken_languages": ("language",),
+    "work_experience": ("company", "start_date", "end_date"),
+    "education": ("institution", "graduation_date"),
+    "certifications": ("name", "issuer"),
+    "projects": ("name",),
+    "awards_and_honors": ("name", "issuer"),
+    "publications": ("title", "publisher"),
+    "volunteer_experience": ("organization", "start_date"),
+    "professional_memberships": ("organization",),
+    "references": ("name", "company"),
+    "additional_sections": ("section_name",),
+}
 
-    def make_question(path: str, *, is_list: bool = False) -> dict[str, Any]:
-        collection = path.split("[*]", maxsplit=1)[0] if "[*]" in path else None
-        is_semantic = any(
-            term in path
-            for term in (
-                "summary", "objective", "description", "responsibilities",
-                "achievements", "additional_sections[*].content",
-            )
-        ) or path.startswith(("target_roles", "skills."))
-        if collection:
-            anchors = record_keys.get(collection, "the record's identifying fields")
-            comparison = (
-                f"Treat {collection} as an unordered array. Match records by {anchors}; "
-                f"compare only {path} within every matched record. Ignore record order, "
-                "but count missing or extra records and missing, incorrect, or unsupported "
-                "values for this field as mismatches."
-            )
-            if is_list:
-                comparison += " If this field is itself an array, ignore item order and check both coverage and unsupported extras."
-        elif is_list and path in record_keys:
-            comparison = (
-                f"Treat {path} as an unordered array of records. Match records by "
-                f"{record_keys[path]}, compare every field in matched records, and "
-                "penalize missing or extra records. Ignore record order."
-            )
-        elif is_list:
-            comparison = (
-                f"Compare {path} as an unordered list: ignore ordering, require all expected "
-                "items to be present, and penalize missing or unsupported extra items."
-            )
-        else:
-            comparison = (
-                f"Compare {path} in actual_output with the same field in expected_output "
-                "and verify it against the resume text. Treat both absent values as a match; "
-                "penalize missing expected values, contradictions, and unsupported additions."
-            )
-        if is_semantic:
-            comparison += " Accept meaning-preserving paraphrases and clear synonyms; do not accept changed or omitted material facts."
-        else:
-            comparison += " Allow harmless capitalization, whitespace, or formatting differences only; the underlying fact must match."
-
-        question_name = path.replace("[*]", "_item").replace(".", "_") + "_match"
-        return {
-            "type": "noul",
-            "name": question_name,
-            "path": path,
-            "question": comparison,
-            "weight": 1.0,
-            "zero_threshold": 0.10 if is_semantic else 0.20,
-            "full_threshold": (
-                0.70
-                if is_list or "[*]" in path or path.endswith(("_date", ".date"))
-                else 0.80
-            ),
-        }
-
-    questions = [make_question(path) for path in scalar_fields]
-    questions.extend(make_question(path, is_list=True) for path in unordered_lists)
-    questions.extend((
-        make_question("skills.spoken_languages", is_list=True),
-        make_question("work_experience", is_list=True),
-        make_question("education", is_list=True),
-        make_question("certifications", is_list=True),
-        make_question("projects", is_list=True),
-        make_question("awards_and_honors", is_list=True),
-        make_question("publications", is_list=True),
-        make_question("volunteer_experience", is_list=True),
-        make_question("professional_memberships", is_list=True),
-        make_question("references", is_list=True),
-        make_question("additional_sections", is_list=True),
-    ))
-    return tuple(questions)
+IDENTITY_PATHS = (
+    "personal_information.full_name",
+    "personal_information.email",
+    "personal_information.phone_numbers",
+)
 
 
 @dataclass(slots=True)
 class EvaluationItem:
-    """One already-prepared case: raw resume text and expected JSON."""
+    """One resume's text and already-prepared expected JSON."""
 
     resume_id: str
     resume_text: str
@@ -220,7 +92,7 @@ class EvaluationItem:
 
 @dataclass(slots=True)
 class ModelCallbackOutput:
-    """Optional wrapper for a callback's prediction and inference details."""
+    """Optional wrapper for a callback prediction and inference metadata."""
 
     raw_output: str | None = None
     prediction: Any = None
@@ -231,7 +103,7 @@ class ModelCallbackOutput:
 
 @dataclass(slots=True)
 class EvaluationResult:
-    """Inference result and Jev's score for one resume."""
+    """One resume's validation and hybrid evaluation scores."""
 
     item: EvaluationItem
     status: str
@@ -242,17 +114,24 @@ class EvaluationResult:
     model_name: str | None = None
     json_valid: bool = False
     schema_valid: bool = False
-    judge_score: float | None = None
-    judge_reason: str | None = None
+    programmatic_score: float | None = None
+    semantic_score: float | None = None
+    overall_score: float | None = None
+    identity_score: float | None = None
     score_breakdown: list[dict[str, Any]] = field(default_factory=list)
     model_metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     duration_seconds: float = 0.0
 
+    @property
+    def judge_score(self) -> float | None:
+        """Compatibility alias used by earlier notebook cells."""
+        return self.overall_score
+
 
 @dataclass(slots=True)
 class EvaluationReport:
-    """Aggregate results from an evaluation run."""
+    """Aggregate results from one evaluation run."""
 
     metrics: dict[str, Any]
     results: list[EvaluationResult]
@@ -271,7 +150,7 @@ def render_json_prompt(
     schema: type[BaseModel] = ResumeOutput,
     prompt_path: Path = DEFAULT_PROMPT_PATH,
 ) -> str:
-    """Render the default JSON-only prompt for a model callback."""
+    """Render the JSON-only prompt used by model callbacks."""
     template = prompt_path.read_text(encoding="utf-8")
     return template.replace(
         "{{JSON_SCHEMA}}",
@@ -279,275 +158,102 @@ def render_json_prompt(
     ).replace("{{RESUME_TEXT_JSON}}", json.dumps(resume_text, ensure_ascii=False))
 
 
+def _normalise_date(value: str) -> str:
+    text = value.strip().casefold()
+    if text in {"present", "current", "now", "ongoing"}:
+        return "current"
+    formats = (
+        "%m/%Y", "%m-%Y", "%m.%Y", "%m/%y", "%m-%y",
+        "%Y-%m", "%Y/%m", "%B %Y", "%b %Y",
+        "%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%Y/%m/%d",
+        "%B %d, %Y", "%b %d, %Y", "%Y",
+    )
+    for date_format in formats:
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            continue
+        if "%d" in date_format:
+            return parsed.strftime("%Y-%m-%d")
+        if "%m" in date_format or "%B" in date_format or "%b" in date_format:
+            return parsed.strftime("%Y-%m")
+        return parsed.strftime("%Y")
+    return re.sub(r"\s+", " ", text)
+
+
+def _normalise(value: Any, path: str) -> Any:
+    """Normalize harmless presentation differences before exact comparison."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    text = unicodedata.normalize("NFKC", value).strip()
+    if not text:
+        return None
+    leaf = path.rsplit(".", maxsplit=1)[-1].replace("[*]", "")
+    if leaf == "email":
+        return text.casefold()
+    if "phone" in leaf:
+        digits = re.sub(r"\D", "", text)
+        return digits or text.casefold()
+    if leaf in {"url", "linkedin", "portfolio", "other_links"} or leaf.endswith("_link"):
+        candidate = text if "://" in text else f"https://{text}"
+        parts = urlsplit(candidate)
+        host = parts.netloc.casefold()
+        url_path = parts.path.rstrip("/")
+        return urlunsplit((parts.scheme.casefold(), host, url_path, parts.query, ""))
+    if leaf.endswith("date") or leaf == "date":
+        return _normalise_date(text)
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+def _stable_json(value: Any, path: str) -> str:
+    """Canonical JSON string for comparing unordered list values and record keys."""
+    if isinstance(value, Mapping):
+        value = {
+            str(key): _normalise(child, f"{path}.{key}")
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    else:
+        value = _normalise(value, path)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _set_metrics(expected: list[Any], generated: list[Any], path: str) -> dict[str, float | int]:
+    """Order-independent multiset precision/recall/F1, including empty lists."""
+    expected_counts = Counter(_stable_json(value, path) for value in expected)
+    generated_counts = Counter(_stable_json(value, path) for value in generated)
+    true_positive = sum((expected_counts & generated_counts).values())
+    false_positive = sum((generated_counts - expected_counts).values())
+    false_negative = sum((expected_counts - generated_counts).values())
+    precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 1.0
+    recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 1.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+    }
+
+
 class Evaluator:
-    """Run model inference, validate JSON, and score it with TypeSafe Jev.
+    """Validate resume JSON, compare structured data deterministically, and
+    ask Jev only about non-identical semantic text fields.
 
-    Prepare ``EvaluationItem`` objects outside this class. The callback receives
-    one item and returns the model's JSON; Jev then compares the prediction with
-    the target while using the original resume text as evidence.
-
-    Custom questions use simple dictionaries with ``type`` (``noul``, ``score``
-    or ``choice``), ``name``, ``question``, and ``weight``. ``levels`` is used
-    by score questions; ``options`` maps choice labels to credits from 0 to 1,
-    or ``None`` when that choice means the question does not apply.
+    ``judge_score`` remains as a compatibility alias for ``overall_score``.
     """
 
-    DEFAULT_QUESTIONS: tuple[dict[str, Any], ...] = (
-        {
-            "type": "noul",
-            "name": "name_match",
-            "question": (
-                "The full name in actual_output.personal_information matches "
-                "expected_output.personal_information, ignoring harmless "
-                "capitalization and spacing differences. If expected_output "
-                "has no name and the resume gives no name, treat that as correct."
-            ),
-            "weight": 1.5,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "noul",
-            "name": "professional_title_match",
-            "question": (
-                "The professional title in actual_output.personal_information "
-                "matches the expected title and is supported by the resume. "
-                "Accept harmless wording or capitalization differences, but "
-                "do not treat a different role as a match."
-            ),
-            "weight": 1.0,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "noul",
-            "name": "email_match",
-            "question": (
-                "The email in actual_output.personal_information matches "
-                "expected_output and the resume. Do not accept a different or invented address."
-            ),
-            "weight": 1.25,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "noul",
-            "name": "phone_numbers_match",
-            "question": (
-                "Phone numbers in actual_output.personal_information match "
-                "the expected numbers regardless of list order or harmless "
-                "formatting such as spaces, parentheses, or hyphens."
-            ),
-            "weight": 1.0,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "noul",
-            "name": "location_and_links_match",
-            "question": (
-                "Address, city, region, postal code, country, LinkedIn, "
-                "portfolio, and other links in actual_output.personal_information "
-                "match expected_output and are supported by the resume."
-            ),
-            "weight": 1.0,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "noul",
-            "name": "target_roles_match",
-            "question": (
-                "The target roles in actual_output.target_roles cover the "
-                "expected roles regardless of order, without changing their meaning."
-            ),
-            "weight": 1.0,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "noul",
-            "name": "skill_recall",
-            "question": (
-                "Every skill listed in expected_output.skills is represented "
-                "in actual_output.skills, allowing clear synonyms and ignoring "
-                "list order. Judge coverage, not wording."
-            ),
-            "weight": 2.0,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "noul",
-            "name": "skill_grounding",
-            "question": (
-                "Skills listed in actual_output.skills are supported by the "
-                "resume text. Do not penalize a clearly supported skill only "
-                "because it is absent from expected_output.skills."
-            ),
-            "weight": 1.5,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "score",
-            "name": "work_experience_core_facts",
-            "question": (
-                "Across corresponding work experience records, are job titles, "
-                "employers, locations, employment types, and start/end dates "
-                "correct against expected_output and the resume? Ignore record order "
-                "and harmless date formatting differences."
-            ),
-            "levels": [
-                "Mostly wrong or unsupported",
-                "Several key role facts are wrong or missing",
-                "Mostly correct with minor omissions or formatting differences",
-                "All expected core role facts are correctly represented and grounded",
-            ],
-            "weight": 2.5,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "score",
-            "name": "work_experience_quality",
-            "question": (
-                "How accurately does actual_output.work_experience capture "
-                "expected responsibilities, achievements, and skills_used? "
-                "Ignore ordering differences and harmless paraphrases; penalize "
-                "material omissions, contradictions, and unsupported claims."
-            ),
-            "levels": [
-                "Mostly wrong, missing, or unsupported",
-                "Major facts are wrong or missing",
-                "Mostly accurate, with some omissions or minor errors",
-                "All material expected facts are accurately represented and grounded",
-            ],
-            "weight": 3.0,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "choice",
-            "name": "long_text_meaning",
-            "question": (
-                "Compare professional_summary, career_objective, work/project/" 
-                "certification/volunteer descriptions, and additional-section content "
-                "in actual_output with expected_output and the resume. Choose the "
-                "best description of factual meaning; paraphrases are acceptable, "
-                "but omissions and unsupported claims matter."
-            ),
-            "options": {
-                "exact_or_equivalent_meaning": 1.0,
-                "same_meaning_with_minor_omission": 0.75,
-                "partly_correct_with_material_omissions": 0.4,
-                "contradictory_or_unsupported": 0.0,
-                "no_comparable_long_text_present": None,
-            },
-            "weight": 2.5,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "score",
-            "name": "education_quality",
-            "question": (
-                "How accurately does actual_output.education match the expected "
-                "education facts and the resume, ignoring ordering and harmless "
-                "format differences in dates or degree wording?"
-            ),
-            "levels": [
-                "Mostly wrong or unsupported",
-                "Major education facts are missing or incorrect",
-                "Mostly correct with minor omissions or differences",
-                "Expected education facts are correctly represented and grounded",
-            ],
-            "weight": 1.5,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "score",
-            "name": "certifications_quality",
-            "question": (
-                "How accurately do certification names, types, issuers, dates, "
-                "credential IDs, and descriptions in actual_output match the "
-                "expected records and the resume? Ignore order, not factual differences."
-            ),
-            "levels": [
-                "Mostly wrong or unsupported",
-                "Major certification facts are missing or incorrect",
-                "Mostly correct with minor omissions or differences",
-                "All expected certification facts are accurately represented and grounded",
-            ],
-            "weight": 1.25,
-            "zero_threshold": 0.20,
-            "full_threshold": 0.90,
-        },
-        {
-            "type": "score",
-            "name": "projects_quality",
-            "question": (
-                "How accurately do project names, roles, technologies, dates, URLs, "
-                "and descriptions in actual_output match expected_output and the resume? "
-                "Ignore project ordering and accept meaning-preserving paraphrases."
-            ),
-            "levels": [
-                "Mostly wrong or unsupported",
-                "Major project facts are missing or incorrect",
-                "Mostly correct with minor omissions or differences",
-                "All expected project facts are accurately represented and grounded",
-            ],
-            "weight": 1.25,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "score",
-            "name": "other_sections_quality",
-            "question": (
-                "How accurately do certifications, projects, awards, publications, "
-                "volunteer experience, memberships, references, and additional "
-                "sections in actual_output match expected_output and the resume? "
-                "Ignore ordering; penalize missing expected facts and unsupported additions."
-            ),
-            "levels": [
-                "Mostly wrong or unsupported",
-                "Several major omissions or errors",
-                "Mostly accurate with some minor omissions or errors",
-                "All applicable expected facts are accurate and grounded",
-            ],
-            "weight": 2.0,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.80,
-        },
-        {
-            "type": "noul",
-            "name": "no_unsupported_facts",
-            "question": (
-                "Every factual claim in actual_output is supported by the resume; "
-                "the output does not invent names, dates, qualifications, employers, "
-                "skills, or achievements."
-            ),
-            "weight": 2.5,
-            "zero_threshold": 0.10,
-            "full_threshold": 0.90,
-        },
-    )
-
-    # Replace the former broad section-level checks with one check per schema leaf.
-    DEFAULT_QUESTIONS = _build_schema_questions()
-
-    def __init__(
-        self,
-        items: Iterable[EvaluationItem | Mapping[str, Any]],
-        *,
-        questions: Sequence[Mapping[str, Any]] | None = None,
-    ) -> None:
+    def __init__(self, items: Iterable[EvaluationItem | Mapping[str, Any]]) -> None:
         self.items = [self._coerce_item(item) for item in items]
         self.schema = ResumeOutput
-        self.questions = [dict(question) for question in (questions or self.DEFAULT_QUESTIONS)]
-        self._validate_questions()
 
     @staticmethod
     def _coerce_item(item: EvaluationItem | Mapping[str, Any]) -> EvaluationItem:
@@ -568,33 +274,6 @@ class Evaluator:
             category=item.get("category"),
             metadata=dict(item.get("metadata", {})),
         )
-
-    def _validate_questions(self) -> None:
-        if not self.questions:
-            raise ValueError("Provide at least one Jev question.")
-        for question in self.questions:
-            kind = question.get("type")
-            if kind not in {"noul", "score", "choice"}:
-                raise ValueError(f"Unsupported Jev question type: {kind!r}.")
-            if not question.get("name") or not question.get("question"):
-                raise ValueError("Each Jev question needs a name and question.")
-            if float(question.get("weight", 1)) <= 0:
-                raise ValueError("Jev question weights must be positive.")
-            zero_threshold = float(question.get("zero_threshold", 0.0))
-            full_threshold = float(question.get("full_threshold", 1.0))
-            if (
-                not math.isfinite(zero_threshold)
-                or not math.isfinite(full_threshold)
-                or not 0.0 <= zero_threshold < full_threshold <= 1.0
-            ):
-                raise ValueError(
-                    f"Question {question['name']!r} must have thresholds satisfying "
-                    "0 <= zero_threshold < full_threshold <= 1."
-                )
-            if kind == "score" and len(question.get("levels", [])) < 2:
-                raise ValueError("Score questions need at least two ordered levels.")
-            if kind == "choice" and not question.get("options"):
-                raise ValueError("Choice questions need an options mapping.")
 
     @staticmethod
     def _json_value(value: Any) -> Any:
@@ -621,142 +300,255 @@ class Evaluator:
         return repr(value)
 
     @staticmethod
-    def _calibrate_score(value: float, *, zero_threshold: float, full_threshold: float) -> float:
-        """Snap weak/strong Jev scores to 0/1; preserve scores between cutoffs."""
-        if value <= zero_threshold:
-            return 0.0
-        if value >= full_threshold:
-            return 1.0
-        return value
+    def _is_semantic(path: str) -> bool:
+        leaf = path.rsplit(".", maxsplit=1)[-1].replace("[*]", "")
+        return leaf in SEMANTIC_FIELDS
 
     @staticmethod
-    def _load_jev_dependencies() -> tuple[Any, Any, Any, Any]:
-        """Load TypeSafe SDK lazily so importing the evaluator stays light."""
+    def _record_key(collection: str, record: Mapping[str, Any]) -> str:
+        keys = RECORD_KEYS.get(collection, ())
+        parts = [_stable_json(record.get(key), f"{collection}[*].{key}") for key in keys]
+        if not keys or all(part in {"null", '""'} for part in parts):
+            return _stable_json(record, f"{collection}[*]")
+        return json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _is_empty(value: Any) -> bool:
+        return value is None or value == "" or value == []
+
+    def _compare(
+        self,
+        path: str,
+        expected: Any,
+        generated: Any,
+        programmatic: list[dict[str, Any]],
+        semantic_cases: dict[str, list[tuple[Any, Any]]],
+        semantic_direct: dict[str, list[float]],
+    ) -> None:
+        if isinstance(expected, Mapping) and isinstance(generated, Mapping):
+            for key in expected.keys() | generated.keys():
+                child_path = f"{path}.{key}" if path else str(key)
+                self._compare(
+                    child_path,
+                    expected.get(key),
+                    generated.get(key),
+                    programmatic,
+                    semantic_cases,
+                    semantic_direct,
+                )
+            return
+
+        if isinstance(expected, list) and isinstance(generated, list):
+            if path in RECORD_KEYS or any(
+                isinstance(value, Mapping) for value in expected + generated
+            ):
+                self._compare_record_lists(
+                    path, expected, generated, programmatic, semantic_cases, semantic_direct
+                )
+                return
+            metrics = _set_metrics(expected, generated, path)
+            if self._is_semantic(path):
+                programmatic.append({
+                    "path": path,
+                    "group": "programmatic",
+                    "metric": "unordered_list_precision_recall_f1",
+                    "value": metrics["f1"],
+                    **metrics,
+                })
+                if metrics["f1"] == 1.0:
+                    semantic_direct[path].append(1.0)
+                else:
+                    semantic_cases[path].append((expected, generated))
+            else:
+                programmatic.append({
+                    "path": path,
+                    "group": "programmatic",
+                    "metric": "unordered_list_precision_recall_f1",
+                    "value": metrics["f1"],
+                    **metrics,
+                })
+            return
+
+        if self._is_semantic(path):
+            if _normalise(expected, path) == _normalise(generated, path):
+                semantic_direct[path].append(1.0)
+            elif self._is_empty(expected) or self._is_empty(generated):
+                # Presence/absence is factual; Jev should not override it.
+                semantic_direct[path].append(0.0)
+            else:
+                semantic_cases[path].append((expected, generated))
+            return
+
+        matches = _normalise(expected, path) == _normalise(generated, path)
+        programmatic.append({
+            "path": path,
+            "group": "programmatic",
+            "metric": "normalized_exact_match",
+            "value": 1.0 if matches else 0.0,
+            "match": matches,
+        })
+
+    def _compare_record_lists(
+        self,
+        path: str,
+        expected: list[Mapping[str, Any]],
+        generated: list[Mapping[str, Any]],
+        programmatic: list[dict[str, Any]],
+        semantic_cases: dict[str, list[tuple[Any, Any]]],
+        semantic_direct: dict[str, list[float]],
+    ) -> None:
+        expected_keys = [self._record_key(path, record) for record in expected]
+        generated_keys = [self._record_key(path, record) for record in generated]
+        metrics = _set_metrics(expected_keys, generated_keys, path)
+        programmatic.append({
+            "path": path,
+            "group": "programmatic",
+            "metric": "unordered_record_precision_recall_f1",
+            "value": metrics["f1"],
+            **metrics,
+        })
+
+        expected_by_key: dict[str, deque[Mapping[str, Any]]] = defaultdict(deque)
+        generated_by_key: dict[str, deque[Mapping[str, Any]]] = defaultdict(deque)
+        for key, record in zip(expected_keys, expected):
+            expected_by_key[key].append(record)
+        for key, record in zip(generated_keys, generated):
+            generated_by_key[key].append(record)
+
+        for key in expected_by_key.keys() & generated_by_key.keys():
+            while expected_by_key[key] and generated_by_key[key]:
+                expected_record = expected_by_key[key].popleft()
+                generated_record = generated_by_key[key].popleft()
+                for field_name in expected_record.keys() | generated_record.keys():
+                    self._compare(
+                        f"{path}[*].{field_name}",
+                        expected_record.get(field_name),
+                        generated_record.get(field_name),
+                        programmatic,
+                        semantic_cases,
+                        semantic_direct,
+                    )
+
+    @staticmethod
+    def _load_jev() -> tuple[Any, Any]:
         try:
-            from typesafe_sdk import Choice, Noul, Score, TypeSafeClient
+            from typesafe_sdk import Noul, TypeSafeClient
         except ImportError as error:
             raise RuntimeError(
-                "Jev dependencies are missing. Install requirements.txt to use the evaluator."
+                "Install requirements.txt to use Jev for semantic comparisons."
             ) from error
-
         if not os.getenv("TYPESAFE_API_KEY"):
-            raise RuntimeError(
-                "TYPESAFE_API_KEY is missing. Add it to the project .env file "
-                "or export it in your shell."
-            )
-        return TypeSafeClient, Noul, Score, Choice
+            raise RuntimeError("TYPESAFE_API_KEY is missing from the environment or project .env.")
+        return TypeSafeClient, Noul
 
-    def _make_jev_questions(self) -> tuple[dict[str, Any], dict[str, dict[str, float | None]]]:
-        TypeSafeClient, Noul, Score, Choice = self._load_jev_dependencies()
+    def _judge_semantics(
+        self,
+        item: EvaluationItem,
+        cases: dict[str, list[tuple[Any, Any]]],
+    ) -> dict[str, float]:
+        """Ask Jev only about non-identical, present semantic values."""
+        if not cases:
+            return {}
+        TypeSafeClient, Noul = self._load_jev()
         questions: dict[str, Any] = {}
-        choice_credits: dict[str, dict[str, float | None]] = {}
-        for spec in self.questions:
-            name = spec["name"]
-            question_type = spec["type"]
-            if question_type == "noul":
-                questions[name] = Noul(instructions=spec["question"])
-            elif question_type == "score":
-                questions[name] = Score(
-                    instructions=spec["question"], criteria=list(spec["levels"])
+        state_cases: dict[str, Any] = {}
+        for index, (path, pairs) in enumerate(sorted(cases.items())):
+            name = f"semantic_field_{index}"
+            questions[name] = Noul(
+                instructions=(
+                    f"Compare each expected and generated value for the resume field {path}. "
+                    "Judge whether the generated value preserves the same factual meaning. "
+                    "Accept faithful paraphrases and clear synonyms. Penalize omissions, "
+                    "contradictions, and unsupported claims. If values are arrays or represent "
+                    "records, ignore ordering and compare corresponding items. The resume is evidence."
                 )
-            else:
-                criteria: dict[str, str | None] = {}
-                choice_credits[name] = {}
-                for option, value in spec["options"].items():
-                    if isinstance(value, Mapping):
-                        credit = value.get("credit")
-                        description = value.get("description", option.replace("_", " "))
-                    else:
-                        credit = value
-                        description = f"{option.replace('_', ' ')} (quality credit {credit})"
-                    choice_credits[name][option] = None if credit is None else float(credit)
-                    criteria[option] = None if credit is None else str(description)
-                questions[name] = Choice(instructions=spec["question"], criteria=criteria)
-        return questions, choice_credits
-
-    def _judge(self, item: EvaluationItem, target: dict[str, Any], prediction: dict[str, Any]):
-        TypeSafeClient, Noul, Score, Choice = self._load_jev_dependencies()
-        questions, choice_credits = self._make_jev_questions()
+            )
+            state_cases[name] = [
+                {"expected": expected, "generated": generated}
+                for expected, generated in pairs
+            ]
         state = {
             "resume_text": item.resume_text,
-            "expected_json": json.dumps(target, ensure_ascii=False),
-            "actual_json": json.dumps(prediction, ensure_ascii=False),
+            "semantic_field_comparisons": json.dumps(state_cases, ensure_ascii=False),
         }
-
         with TypeSafeClient() as client:
             response = client.system_one(state=state, questions=questions)
-        breakdown = []
-        weighted_total = 0.0
-        total_weight = 0.0
-        for spec in self.questions:
-            name = spec["name"]
-            kind = spec["type"]
-            weight = float(spec.get("weight", 1.0))
-            if kind == "noul":
-                answer = response.nouls[name]
-                value = float(answer.noul)
-                probabilities = {"yes": value, "no": 1.0 - value}
-            elif kind == "score":
-                answer = response.scores[name]
-                highest = len(spec["levels"]) - 1
-                value = float(answer.score) / highest
-                probabilities = self._json_safe(getattr(answer, "probabilities", {}))
-            else:
-                answer = response.choices[name]
-                probabilities = self._json_safe(getattr(answer, "probabilities", {}))
-                credits = choice_credits[name]
-                applicable_mass = sum(
-                    float(probabilities.get(option, 0.0))
-                    for option, credit in credits.items()
-                    if credit is not None
-                )
-                if applicable_mass >= 0.5:
-                    value = sum(
-                        float(probabilities.get(option, 0.0)) * float(credit)
-                        for option, credit in credits.items()
-                        if credit is not None
-                    ) / applicable_mass
-                else:
-                    value = None
+        scores = {}
+        for name, path in zip(questions, sorted(cases)):
+            scores[path] = float(response.nouls[name].noul)
+        return scores
 
-            applies = value is not None
-            raw_value = value
-            zero_threshold = float(spec.get("zero_threshold", 0.0))
-            full_threshold = float(spec.get("full_threshold", 1.0))
-            if applies:
-                value = self._calibrate_score(
-                    float(raw_value),
-                    zero_threshold=zero_threshold,
-                    full_threshold=full_threshold,
-                )
-            breakdown.append({
-                "name": name,
-                "path": spec.get("path"),
-                "type": kind,
-                "weight": weight,
-                "value": round(value, 6) if applies else None,
-                "raw_value": round(raw_value, 6) if applies else None,
-                "thresholds": {
-                    "zero_at_or_below": zero_threshold,
-                    "full_at_or_above": full_threshold,
-                },
-                "calibrated": bool(applies and value != raw_value),
-                "applicable": applies,
-                "answer": self._json_safe(getattr(answer, "choice", getattr(answer, "score", getattr(answer, "noul", None)))),
-                "confidence": self._json_safe(getattr(answer, "confidence", None)),
-                "probabilities": probabilities,
+    def _score_prediction(
+        self,
+        item: EvaluationItem,
+        target: dict[str, Any],
+        prediction: dict[str, Any],
+    ) -> tuple[float, float | None, float, float, list[dict[str, Any]], str | None]:
+        programmatic: list[dict[str, Any]] = []
+        semantic_cases: dict[str, list[tuple[Any, Any]]] = defaultdict(list)
+        semantic_direct: dict[str, list[float]] = defaultdict(list)
+        self._compare("", target, prediction, programmatic, semantic_cases, semantic_direct)
+
+        semantic_error = None
+        try:
+            semantic_jev = self._judge_semantics(item, semantic_cases)
+        except Exception as error:
+            semantic_jev = {}
+            semantic_error = f"{type(error).__name__}: {error}"
+        semantic_breakdown: list[dict[str, Any]] = []
+        semantic_paths = semantic_direct.keys() | semantic_cases.keys()
+        for path in sorted(semantic_paths):
+            direct_scores = semantic_direct.get(path, [])
+            jev_score = semantic_jev.get(path)
+            case_count = len(semantic_cases.get(path, []))
+            scores = direct_scores + ([jev_score] * case_count if jev_score is not None else [])
+            value = (
+                sum(scores) / len(scores)
+                if scores and (not case_count or jev_score is not None)
+                else None
+            )
+            semantic_breakdown.append({
+                "path": path,
+                "group": "semantic",
+                "metric": "exact_or_jev_semantic_match",
+                "value": value,
+                "exact_cases": len(direct_scores),
+                "jev_cases": case_count,
+                "jev_score": jev_score,
+                "error": semantic_error if case_count and jev_score is None else None,
             })
-            if applies:
-                weighted_total += weight * float(value)
-                total_weight += weight
 
-        final_score = weighted_total / total_weight if total_weight else 1.0
-        reason = "; ".join(
-            f"{entry['name']}: {entry['answer']} (score={entry['value']})"
-            for entry in breakdown
-            if entry["applicable"]
+        programmatic_score = (
+            sum(float(entry["value"]) for entry in programmatic) / len(programmatic)
+            if programmatic
+            else 1.0
         )
-        return round(final_score, 6), reason, breakdown
+        semantic_values = [
+            float(entry["value"])
+            for entry in semantic_breakdown
+            if entry["value"] is not None
+        ]
+        semantic_score = (
+            sum(semantic_values) / len(semantic_values)
+            if semantic_values and semantic_error is None
+            else None
+        )
+        overall_score = (
+            (programmatic_score + semantic_score) / 2
+            if semantic_score is not None
+            else None if semantic_error else programmatic_score
+        )
+
+        fields_by_path = {entry["path"]: float(entry["value"]) for entry in programmatic}
+        fields_by_path.update({
+            entry["path"]: float(entry["value"])
+            for entry in semantic_breakdown
+            if entry["value"] is not None
+        })
+        identity_values = [fields_by_path[path] for path in IDENTITY_PATHS if path in fields_by_path]
+        identity_score = sum(identity_values) / len(identity_values) if identity_values else 1.0
+        breakdown = programmatic + semantic_breakdown
+        return programmatic_score, semantic_score, overall_score, identity_score, breakdown, semantic_error
 
     def _evaluate_one(self, item: EvaluationItem, callback: ModelCallback) -> EvaluationResult:
         started = time.perf_counter()
@@ -785,13 +577,11 @@ class Evaluator:
                     )
                 else:
                     prediction_value = callback_output
-
-                if isinstance(prediction_value, str):
-                    result.raw_output = result.raw_output or prediction_value
-                else:
-                    result.raw_output = json.dumps(
-                        self._json_safe(prediction_value), ensure_ascii=False
-                    )
+                result.raw_output = (
+                    prediction_value
+                    if isinstance(prediction_value, str)
+                    else json.dumps(self._json_safe(prediction_value), ensure_ascii=False)
+                )
                 parsed = self._json_value(prediction_value)
                 result.json_valid = True
             except json.JSONDecodeError as error:
@@ -813,40 +603,49 @@ class Evaluator:
                 return result
 
             try:
-                result.judge_score, result.judge_reason, result.score_breakdown = self._judge(
-                    item, target, prediction
-                )
-                result.status = "SCORED"
+                (
+                    result.programmatic_score,
+                    result.semantic_score,
+                    result.overall_score,
+                    result.identity_score,
+                    result.score_breakdown,
+                    semantic_error,
+                ) = self._score_prediction(item, target, prediction)
+                result.error = semantic_error
+                result.status = "SCORED_WITH_SEMANTIC_ERROR" if semantic_error else "SCORED"
             except Exception as error:
-                result.status = "JUDGE_FAILED"
+                result.status = "SEMANTIC_JUDGE_FAILED"
                 result.error = f"{type(error).__name__}: {error}"
             return result
         finally:
             result.duration_seconds = round(time.perf_counter() - started, 4)
 
+    @staticmethod
+    def _mean(results: list[EvaluationResult], field_name: str) -> float | None:
+        values = [getattr(result, field_name) for result in results]
+        values = [float(value) for value in values if value is not None]
+        return round(sum(values) / len(values), 6) if values else None
+
     def _summarize(self, results: list[EvaluationResult]) -> dict[str, Any]:
         valid_targets = [result for result in results if result.target is not None]
-        judged = [result for result in valid_targets if result.judge_score is not None]
+        scored = [result for result in valid_targets if result.overall_score is not None]
         denominator = len(valid_targets)
-        status_counts = dict(Counter(result.status for result in results))
         return {
             "items_evaluated": len(results),
             "valid_targets": denominator,
             "json_valid_count": sum(result.json_valid for result in results),
             "schema_valid_count": sum(result.schema_valid for result in results),
-            "judged_count": len(judged),
-            "mean_jev_score_on_judged": (
-                round(sum(result.judge_score for result in judged) / len(judged), 6)
-                if judged
-                else None
-            ),
-            # Invalid predictions count as zero; invalid targets are excluded.
+            "scored_count": len(scored),
+            "mean_programmatic_score": self._mean(valid_targets, "programmatic_score"),
+            "mean_semantic_score": self._mean(valid_targets, "semantic_score"),
+            "mean_overall_score": self._mean(valid_targets, "overall_score"),
+            "mean_identity_score": self._mean(valid_targets, "identity_score"),
             "overall_score_including_invalid_predictions": (
-                round(sum(result.judge_score or 0.0 for result in valid_targets) / denominator, 6)
+                round(sum(result.overall_score or 0.0 for result in valid_targets) / denominator, 6)
                 if denominator
                 else None
             ),
-            "status_counts": status_counts,
+            "status_counts": dict(Counter(result.status for result in results)),
             "score_range": [0.0, 1.0],
         }
 
@@ -862,7 +661,7 @@ class Evaluator:
         output_dir: Path | str | None = None,
         show_progress: bool = True,
     ) -> EvaluationReport:
-        """Run the callback and Jev judge on all or a deterministic test sample."""
+        """Run inference, deterministic scoring, and semantic fallback where needed."""
         if workers < 1:
             raise ValueError("workers must be at least 1")
         if test_size is not None:
@@ -894,14 +693,13 @@ class Evaluator:
 
         results: list[EvaluationResult] = []
         result_path = run_dir / "results.jsonl"
-        futures = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(self._evaluate_one, item, callback): item for item in selected}
+            futures = [executor.submit(self._evaluate_one, item, callback) for item in selected]
             with result_path.open("w", encoding="utf-8") as handle:
                 for future in tqdm(
                     as_completed(futures),
                     total=len(futures),
-                    desc=f"Evaluating with Jev ({workers} workers)",
+                    desc=f"Evaluating resumes ({workers} workers)",
                     unit="resume",
                     disable=not show_progress,
                 ):
@@ -921,12 +719,134 @@ class Evaluator:
             "seed": seed,
             "workers": workers,
             "selected_resume_ids": [item.resume_id for item in selected],
-            "question_weights": {q["name"]: q.get("weight", 1.0) for q in self.questions},
         })
         (run_dir / "metrics.json").write_text(
             json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         return EvaluationReport(metrics=metrics, results=results, output_dir=run_dir, manifest=manifest)
+
+    def plot_results(
+        self,
+        report: EvaluationReport,
+        *,
+        max_resumes: int = 30,
+        max_fields: int = 15,
+        save_path: Path | str | None = None,
+        show: bool = True,
+    ) -> Any:
+        """Plot run-level metrics, score distribution, resume scores, and field scores.
+
+        Returns the Matplotlib figure so callers can customize or save it. Install
+        Matplotlib with ``pip install -r requirements.txt`` to use this method.
+        """
+        if not isinstance(report, EvaluationReport):
+            raise TypeError("report must be the EvaluationReport returned by evaluate().")
+        if max_resumes < 1 or max_fields < 1:
+            raise ValueError("max_resumes and max_fields must be positive.")
+
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as error:
+            raise RuntimeError(
+                "Matplotlib is required for plotting. Run: pip install -r requirements.txt"
+            ) from error
+
+        scored = [result for result in report.results if result.overall_score is not None]
+        figure, axes = plt.subplots(2, 2, figsize=(15, 10))
+        figure.suptitle("Resume parser evaluation", fontsize=16, fontweight="bold")
+
+        # Aggregate score and output-validity metrics.
+        metric_names = {
+            "mean_overall_score": "Overall",
+            "mean_programmatic_score": "Programmatic",
+            "mean_semantic_score": "Semantic",
+            "mean_identity_score": "Identity",
+        }
+        metric_values = [
+            (label, report.metrics.get(key))
+            for key, label in metric_names.items()
+            if report.metrics.get(key) is not None
+        ]
+        metric_values.extend((
+            ("JSON valid", report.metrics.get("json_valid_count", 0) / max(len(report.results), 1)),
+            ("Schema valid", report.metrics.get("schema_valid_count", 0) / max(len(report.results), 1)),
+        ))
+        metric_axis = axes[0, 0]
+        if metric_values:
+            labels, values = zip(*metric_values)
+            bars = metric_axis.bar(labels, [value * 100 for value in values], color="#3977b8")
+            metric_axis.bar_label(bars, fmt="%.1f%%", padding=3)
+            metric_axis.set_ylim(0, 110)
+            metric_axis.tick_params(axis="x", rotation=20)
+            metric_axis.set_ylabel("Score / valid outputs (%)")
+        else:
+            metric_axis.text(0.5, 0.5, "No aggregate metrics", ha="center", va="center")
+        metric_axis.set_title("Run summary")
+        metric_axis.grid(axis="y", alpha=0.2)
+
+        # Distribution shows whether a high mean hides weak individual resumes.
+        distribution_axis = axes[0, 1]
+        if scored:
+            distribution_axis.hist(
+                [result.overall_score * 100 for result in scored],
+                bins=10,
+                range=(0, 100),
+                color="#4b9b79",
+                edgecolor="white",
+            )
+            distribution_axis.set_xlim(0, 100)
+            distribution_axis.set_xlabel("Overall score (%)")
+            distribution_axis.set_ylabel("Number of resumes")
+        else:
+            distribution_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
+        distribution_axis.set_title("Overall-score distribution")
+        distribution_axis.grid(axis="y", alpha=0.2)
+
+        # Show the lowest-scoring resumes first to make inspection actionable.
+        resume_axis = axes[1, 0]
+        lowest_scores = sorted(scored, key=lambda result: result.overall_score)[:max_resumes]
+        if lowest_scores:
+            labels = [result.item.resume_id or "(no id)" for result in lowest_scores]
+            values = [result.overall_score * 100 for result in lowest_scores]
+            resume_axis.barh(labels, values, color="#d48b45")
+            resume_axis.set_xlim(0, 100)
+            resume_axis.set_xlabel("Overall score (%)")
+            resume_axis.invert_yaxis()
+        else:
+            resume_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
+        resume_axis.set_title(f"Lowest-scoring resumes (up to {max_resumes})")
+        resume_axis.grid(axis="x", alpha=0.2)
+
+        # Mean field-level values reveal which parts of the schema need work.
+        field_scores: dict[str, list[float]] = defaultdict(list)
+        for result in scored:
+            for entry in result.score_breakdown:
+                value = entry.get("value")
+                if value is not None:
+                    label = f"{entry.get('group', 'field')}: {entry['path']}"
+                    field_scores[label].append(float(value))
+        field_means = sorted(
+            ((path, sum(values) / len(values)) for path, values in field_scores.items()),
+            key=lambda item: item[1],
+        )[:max_fields]
+        field_axis = axes[1, 1]
+        if field_means:
+            labels, values = zip(*field_means)
+            field_axis.barh(labels, [value * 100 for value in values], color="#8a70b2")
+            field_axis.set_xlim(0, 100)
+            field_axis.set_xlabel("Mean field score (%)")
+            field_axis.invert_yaxis()
+        else:
+            field_axis.text(0.5, 0.5, "No field scores available", ha="center", va="center")
+        field_axis.set_title(f"Lowest-scoring fields (up to {max_fields})")
+        field_axis.grid(axis="x", alpha=0.2)
+
+        figure.tight_layout(rect=(0, 0, 1, 0.96))
+        if save_path is not None:
+            figure.savefig(save_path, dpi=160, bbox_inches="tight")
+        if show:
+            plt.show()
+        return figure
 
     def _result_dict(self, result: EvaluationResult) -> dict[str, Any]:
         return {
@@ -941,8 +861,10 @@ class Evaluator:
             "status": result.status,
             "json_valid": result.json_valid,
             "schema_valid": result.schema_valid,
-            "jev_score": result.judge_score,
-            "jev_reason": result.judge_reason,
+            "programmatic_score": result.programmatic_score,
+            "semantic_score": result.semantic_score,
+            "overall_score": result.overall_score,
+            "identity_score": result.identity_score,
             "score_breakdown": result.score_breakdown,
             "model_name": result.model_name,
             "model_metadata": self._json_safe(result.model_metadata),
