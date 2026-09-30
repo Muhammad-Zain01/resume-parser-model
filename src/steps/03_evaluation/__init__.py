@@ -7,6 +7,8 @@ from .evaluator import (
     Evaluator,
     ModelCallbackOutput,
     render_json_prompt,
+    report_results,
+    strict_json_schema,
 )
 
 __all__ = [
@@ -16,4 +18,6 @@ __all__ = [
     "Evaluator",
     "ModelCallbackOutput",
     "render_json_prompt",
+    "report_results",
+    "strict_json_schema",
 ]

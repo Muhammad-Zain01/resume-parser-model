@@ -158,6 +158,32 @@ def render_json_prompt(
     ).replace("{{RESUME_TEXT_JSON}}", json.dumps(resume_text, ensure_ascii=False))
 
 
+def strict_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of a JSON schema that strict structured-output providers accept.
+
+    OpenAI and Azure require every object to set ``additionalProperties: false``
+    and to list every property in ``required``. Pydantic marks fields with
+    defaults as optional, so those are added to ``required`` and ``default``
+    values are dropped.
+    """
+    def transform(node: Any) -> Any:
+        if isinstance(node, Mapping):
+            result = {
+                key: transform(value)
+                for key, value in node.items()
+                if key != "default"
+            }
+            if isinstance(result.get("properties"), Mapping):
+                result["additionalProperties"] = False
+                result["required"] = list(result["properties"])
+            return result
+        if isinstance(node, list):
+            return [transform(value) for value in node]
+        return node
+
+    return transform(dict(schema))
+
+
 def _normalise_date(value: str) -> str:
     text = value.strip().casefold()
     if text in {"present", "current", "now", "ongoing"}:
@@ -725,129 +751,6 @@ class Evaluator:
         )
         return EvaluationReport(metrics=metrics, results=results, output_dir=run_dir, manifest=manifest)
 
-    def plot_results(
-        self,
-        report: EvaluationReport,
-        *,
-        max_resumes: int = 30,
-        max_fields: int = 15,
-        save_path: Path | str | None = None,
-        show: bool = True,
-    ) -> Any:
-        """Plot run-level metrics, score distribution, resume scores, and field scores.
-
-        Returns the Matplotlib figure so callers can customize or save it. Install
-        Matplotlib with ``pip install -r requirements.txt`` to use this method.
-        """
-        if not isinstance(report, EvaluationReport):
-            raise TypeError("report must be the EvaluationReport returned by evaluate().")
-        if max_resumes < 1 or max_fields < 1:
-            raise ValueError("max_resumes and max_fields must be positive.")
-
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError as error:
-            raise RuntimeError(
-                "Matplotlib is required for plotting. Run: pip install -r requirements.txt"
-            ) from error
-
-        scored = [result for result in report.results if result.overall_score is not None]
-        figure, axes = plt.subplots(2, 2, figsize=(15, 10))
-        figure.suptitle("Resume parser evaluation", fontsize=16, fontweight="bold")
-
-        # Aggregate score and output-validity metrics.
-        metric_names = {
-            "mean_overall_score": "Overall",
-            "mean_programmatic_score": "Programmatic",
-            "mean_semantic_score": "Semantic",
-            "mean_identity_score": "Identity",
-        }
-        metric_values = [
-            (label, report.metrics.get(key))
-            for key, label in metric_names.items()
-            if report.metrics.get(key) is not None
-        ]
-        metric_values.extend((
-            ("JSON valid", report.metrics.get("json_valid_count", 0) / max(len(report.results), 1)),
-            ("Schema valid", report.metrics.get("schema_valid_count", 0) / max(len(report.results), 1)),
-        ))
-        metric_axis = axes[0, 0]
-        if metric_values:
-            labels, values = zip(*metric_values)
-            bars = metric_axis.bar(labels, [value * 100 for value in values], color="#3977b8")
-            metric_axis.bar_label(bars, fmt="%.1f%%", padding=3)
-            metric_axis.set_ylim(0, 110)
-            metric_axis.tick_params(axis="x", rotation=20)
-            metric_axis.set_ylabel("Score / valid outputs (%)")
-        else:
-            metric_axis.text(0.5, 0.5, "No aggregate metrics", ha="center", va="center")
-        metric_axis.set_title("Run summary")
-        metric_axis.grid(axis="y", alpha=0.2)
-
-        # Distribution shows whether a high mean hides weak individual resumes.
-        distribution_axis = axes[0, 1]
-        if scored:
-            distribution_axis.hist(
-                [result.overall_score * 100 for result in scored],
-                bins=10,
-                range=(0, 100),
-                color="#4b9b79",
-                edgecolor="white",
-            )
-            distribution_axis.set_xlim(0, 100)
-            distribution_axis.set_xlabel("Overall score (%)")
-            distribution_axis.set_ylabel("Number of resumes")
-        else:
-            distribution_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
-        distribution_axis.set_title("Overall-score distribution")
-        distribution_axis.grid(axis="y", alpha=0.2)
-
-        # Show the lowest-scoring resumes first to make inspection actionable.
-        resume_axis = axes[1, 0]
-        lowest_scores = sorted(scored, key=lambda result: result.overall_score)[:max_resumes]
-        if lowest_scores:
-            labels = [result.item.resume_id or "(no id)" for result in lowest_scores]
-            values = [result.overall_score * 100 for result in lowest_scores]
-            resume_axis.barh(labels, values, color="#d48b45")
-            resume_axis.set_xlim(0, 100)
-            resume_axis.set_xlabel("Overall score (%)")
-            resume_axis.invert_yaxis()
-        else:
-            resume_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
-        resume_axis.set_title(f"Lowest-scoring resumes (up to {max_resumes})")
-        resume_axis.grid(axis="x", alpha=0.2)
-
-        # Mean field-level values reveal which parts of the schema need work.
-        field_scores: dict[str, list[float]] = defaultdict(list)
-        for result in scored:
-            for entry in result.score_breakdown:
-                value = entry.get("value")
-                if value is not None:
-                    label = f"{entry.get('group', 'field')}: {entry['path']}"
-                    field_scores[label].append(float(value))
-        field_means = sorted(
-            ((path, sum(values) / len(values)) for path, values in field_scores.items()),
-            key=lambda item: item[1],
-        )[:max_fields]
-        field_axis = axes[1, 1]
-        if field_means:
-            labels, values = zip(*field_means)
-            field_axis.barh(labels, [value * 100 for value in values], color="#8a70b2")
-            field_axis.set_xlim(0, 100)
-            field_axis.set_xlabel("Mean field score (%)")
-            field_axis.invert_yaxis()
-        else:
-            field_axis.text(0.5, 0.5, "No field scores available", ha="center", va="center")
-        field_axis.set_title(f"Lowest-scoring fields (up to {max_fields})")
-        field_axis.grid(axis="x", alpha=0.2)
-
-        figure.tight_layout(rect=(0, 0, 1, 0.96))
-        if save_path is not None:
-            figure.savefig(save_path, dpi=160, bbox_inches="tight")
-        if show:
-            plt.show()
-        return figure
-
     def _result_dict(self, result: EvaluationResult) -> dict[str, Any]:
         return {
             "resume_id": result.item.resume_id,
@@ -873,6 +776,335 @@ class Evaluator:
         }
 
 
+def _load_pyplot() -> Any:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as error:
+        raise RuntimeError(
+            "Matplotlib is required for plotting. Run: pip install -r requirements.txt"
+        ) from error
+    return plt
+
+
+def _safe_directory_name(label: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", label).strip("._-")
+    return cleaned or "model"
+
+
+def _report_label(report: EvaluationReport, fallback: str) -> str:
+    for result in report.results:
+        if result.model_name:
+            return result.model_name
+    return fallback
+
+
+def _report_stats(label: str, report: EvaluationReport) -> dict[str, Any]:
+    metrics = report.metrics
+    durations = [result.duration_seconds for result in report.results if result.duration_seconds]
+    return {
+        "label": label,
+        "items_evaluated": metrics.get("items_evaluated"),
+        "json_valid_count": metrics.get("json_valid_count"),
+        "schema_valid_count": metrics.get("schema_valid_count"),
+        "scored_count": metrics.get("scored_count"),
+        "mean_overall_score": metrics.get("mean_overall_score"),
+        "mean_programmatic_score": metrics.get("mean_programmatic_score"),
+        "mean_semantic_score": metrics.get("mean_semantic_score"),
+        "mean_identity_score": metrics.get("mean_identity_score"),
+        "mean_duration_seconds": (sum(durations) / len(durations)) if durations else None,
+        "status_counts": metrics.get("status_counts", {}),
+        "run_output_dir": str(report.output_dir),
+    }
+
+
+def _format_score(value: Any) -> str:
+    return "n/a" if value is None else f"{value * 100:.2f}%"
+
+
+def _print_stats(stats_by_label: Mapping[str, Mapping[str, Any]]) -> None:
+    for label, stats in stats_by_label.items():
+        duration = stats.get("mean_duration_seconds")
+        print(f"[{label}]")
+        print(
+            f"  items={stats['items_evaluated']} json_valid={stats['json_valid_count']} "
+            f"schema_valid={stats['schema_valid_count']} scored={stats['scored_count']}"
+        )
+        print(
+            f"  overall={_format_score(stats['mean_overall_score'])} "
+            f"programmatic={_format_score(stats['mean_programmatic_score'])} "
+            f"semantic={_format_score(stats['mean_semantic_score'])} "
+            f"identity={_format_score(stats['mean_identity_score'])} "
+            f"mean_seconds={'n/a' if duration is None else f'{duration:.2f}s'}"
+        )
+        status_counts = stats.get("status_counts") or {}
+        if status_counts:
+            print("  statuses: " + ", ".join(f"{name}={count}" for name, count in sorted(status_counts.items())))
+
+
+def _normalise_reports(
+    reports: EvaluationReport | Mapping[str, EvaluationReport] | Iterable[EvaluationReport],
+) -> list[tuple[str, EvaluationReport]]:
+    if isinstance(reports, EvaluationReport):
+        return [(_report_label(reports, "model"), reports)]
+    if isinstance(reports, Mapping):
+        entries: list[tuple[str, EvaluationReport]] = []
+        for label, report in reports.items():
+            if not isinstance(report, EvaluationReport):
+                raise TypeError("Every value in a reports mapping must be an EvaluationReport.")
+            entries.append((str(label), report))
+        if not entries:
+            raise ValueError("reports must contain at least one evaluation report.")
+        return entries
+    if isinstance(reports, Iterable):
+        entries = []
+        for index, report in enumerate(reports, start=1):
+            if not isinstance(report, EvaluationReport):
+                raise TypeError("Every item must be an EvaluationReport.")
+            entries.append((_report_label(report, f"model_{index}"), report))
+        if not entries:
+            raise ValueError("reports must contain at least one evaluation report.")
+        return entries
+    raise TypeError(
+        "reports must be an EvaluationReport, a mapping of label -> report, or an iterable of reports."
+    )
+
+
+def _build_model_figure(
+    label: str,
+    report: EvaluationReport,
+    max_resumes: int,
+    max_fields: int,
+    plt: Any,
+) -> Any:
+    scored = [result for result in report.results if result.overall_score is not None]
+    figure, axes = plt.subplots(2, 2, figsize=(15, 10))
+    figure.suptitle(f"Resume parser evaluation: {label}", fontsize=16, fontweight="bold")
+
+    # Aggregate score and output-validity metrics.
+    metric_names = {
+        "mean_overall_score": "Overall",
+        "mean_programmatic_score": "Programmatic",
+        "mean_semantic_score": "Semantic",
+        "mean_identity_score": "Identity",
+    }
+    metric_values = [
+        (metric_label, report.metrics.get(key))
+        for key, metric_label in metric_names.items()
+        if report.metrics.get(key) is not None
+    ]
+    metric_values.extend((
+        ("JSON valid", report.metrics.get("json_valid_count", 0) / max(len(report.results), 1)),
+        ("Schema valid", report.metrics.get("schema_valid_count", 0) / max(len(report.results), 1)),
+    ))
+    metric_axis = axes[0, 0]
+    if metric_values:
+        labels, values = zip(*metric_values)
+        bars = metric_axis.bar(labels, [value * 100 for value in values], color="#3977b8")
+        metric_axis.bar_label(bars, fmt="%.1f%%", padding=3)
+        metric_axis.set_ylim(0, 110)
+        metric_axis.tick_params(axis="x", rotation=20)
+        metric_axis.set_ylabel("Score / valid outputs (%)")
+    else:
+        metric_axis.text(0.5, 0.5, "No aggregate metrics", ha="center", va="center")
+    metric_axis.set_title("Run summary")
+    metric_axis.grid(axis="y", alpha=0.2)
+
+    # Distribution shows whether a high mean hides weak individual resumes.
+    distribution_axis = axes[0, 1]
+    if scored:
+        distribution_axis.hist(
+            [result.overall_score * 100 for result in scored],
+            bins=10,
+            range=(0, 100),
+            color="#4b9b79",
+            edgecolor="white",
+        )
+        distribution_axis.set_xlim(0, 100)
+        distribution_axis.set_xlabel("Overall score (%)")
+        distribution_axis.set_ylabel("Number of resumes")
+    else:
+        distribution_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
+    distribution_axis.set_title("Overall-score distribution")
+    distribution_axis.grid(axis="y", alpha=0.2)
+
+    # Show the lowest-scoring resumes first to make inspection actionable.
+    resume_axis = axes[1, 0]
+    lowest_scores = sorted(scored, key=lambda result: result.overall_score)[:max_resumes]
+    if lowest_scores:
+        labels = [result.item.resume_id or "(no id)" for result in lowest_scores]
+        values = [result.overall_score * 100 for result in lowest_scores]
+        resume_axis.barh(labels, values, color="#d48b45")
+        resume_axis.set_xlim(0, 100)
+        resume_axis.set_xlabel("Overall score (%)")
+        resume_axis.invert_yaxis()
+    else:
+        resume_axis.text(0.5, 0.5, "No scored resumes", ha="center", va="center")
+    resume_axis.set_title(f"Lowest-scoring resumes (up to {max_resumes})")
+    resume_axis.grid(axis="x", alpha=0.2)
+
+    # Mean field-level values reveal which parts of the schema need work.
+    field_scores: dict[str, list[float]] = defaultdict(list)
+    for result in scored:
+        for entry in result.score_breakdown:
+            value = entry.get("value")
+            if value is not None:
+                field_label = f"{entry.get('group', 'field')}: {entry['path']}"
+                field_scores[field_label].append(float(value))
+    field_means = sorted(
+        ((path, sum(values) / len(values)) for path, values in field_scores.items()),
+        key=lambda item: item[1],
+    )[:max_fields]
+    field_axis = axes[1, 1]
+    if field_means:
+        labels, values = zip(*field_means)
+        field_axis.barh(labels, [value * 100 for value in values], color="#8a70b2")
+        field_axis.set_xlim(0, 100)
+        field_axis.set_xlabel("Mean field score (%)")
+        field_axis.invert_yaxis()
+    else:
+        field_axis.text(0.5, 0.5, "No field scores available", ha="center", va="center")
+    field_axis.set_title(f"Lowest-scoring fields (up to {max_fields})")
+    field_axis.grid(axis="x", alpha=0.2)
+
+    figure.tight_layout(rect=(0, 0, 1, 0.96))
+    return figure
+
+
+def _build_comparison_figure(reports: Mapping[str, EvaluationReport], plt: Any) -> Any:
+    labels = list(reports)
+    figure, axes = plt.subplots(1, 2, figsize=(16, 6))
+    figure.suptitle("Model comparison", fontsize=16, fontweight="bold")
+
+    # Mean accuracy per metric, grouped by model.
+    metric_names = {
+        "mean_overall_score": "Overall",
+        "mean_programmatic_score": "Programmatic",
+        "mean_semantic_score": "Semantic",
+        "mean_identity_score": "Identity",
+    }
+    accuracy_axis = axes[0]
+    width = 0.8 / len(metric_names)
+    positions = list(range(len(labels)))
+    for index, (key, label) in enumerate(metric_names.items()):
+        values = [
+            (report.metrics.get(key) or 0.0) * 100
+            for report in reports.values()
+        ]
+        offsets = [position - 0.4 + width * (index + 0.5) for position in positions]
+        bars = accuracy_axis.bar(offsets, values, width=width, label=label)
+        accuracy_axis.bar_label(bars, fmt="%.1f", padding=2, fontsize=8)
+    accuracy_axis.set_xticks(positions, labels, rotation=15, ha="right")
+    accuracy_axis.set_ylim(0, 110)
+    accuracy_axis.set_ylabel("Mean score (%)")
+    accuracy_axis.legend(loc="lower right", fontsize=9)
+    accuracy_axis.set_title("Average accuracy by model")
+    accuracy_axis.grid(axis="y", alpha=0.2)
+
+    # Cumulative mean overall score across resumes, ordered by resume id.
+    cumulative_axis = axes[1]
+    resume_sets = []
+    longest = 0
+    for label, report in reports.items():
+        scored = sorted(
+            (result for result in report.results if result.overall_score is not None),
+            key=lambda result: result.item.resume_id,
+        )
+        resume_sets.append(frozenset(result.item.resume_id for result in scored))
+        if not scored:
+            continue
+        running_total = 0.0
+        values = []
+        for count, result in enumerate(scored, start=1):
+            running_total += result.overall_score
+            values.append(running_total / count * 100)
+        longest = max(longest, len(values))
+        cumulative_axis.plot(range(1, len(values) + 1), values, marker="o", markersize=3, label=label)
+    cumulative_axis.set_xlabel("Resumes evaluated (ordered by resume id)")
+    cumulative_axis.set_ylabel("Cumulative mean overall score (%)")
+    cumulative_axis.set_ylim(0, 100)
+    if longest:
+        cumulative_axis.set_xlim(1, longest)
+    cumulative_axis.legend(loc="lower right", fontsize=9)
+    cumulative_axis.set_title(
+        "Cumulative mean overall score"
+        if len(set(resume_sets)) == 1
+        else "Cumulative mean overall score (resume sets differ)"
+    )
+    cumulative_axis.grid(alpha=0.2)
+
+    figure.tight_layout(rect=(0, 0, 1, 0.94))
+    return figure
+
+
+def report_results(
+    reports: EvaluationReport | Mapping[str, EvaluationReport] | Iterable[EvaluationReport],
+    *,
+    output_dir: Path | str = PROJECT_ROOT / "Results",
+    max_resumes: int = 30,
+    max_fields: int = 15,
+    show: bool = True,
+) -> dict[str, Any]:
+    """Print, plot, and persist performance for one model or several models.
+
+    ``reports`` can be a single :class:`EvaluationReport`, a mapping of label to
+    report, or any iterable of reports. The stats are printed, and every model gets
+    ``<output_dir>/<model>/performance.png`` plus ``<output_dir>/<model>/metrics.json``.
+    When more than one model is given, ``<output_dir>/comparison.png`` and
+    ``<output_dir>/comparison.json`` are written as well.
+    """
+    entries = _normalise_reports(reports)
+    if max_resumes < 1 or max_fields < 1:
+        raise ValueError("max_resumes and max_fields must be positive.")
+    plt = _load_pyplot()
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    stats_by_label: dict[str, dict[str, Any]] = {}
+    saved: dict[str, dict[str, str]] = {}
+    for label, report in entries:
+        stats = _report_stats(label, report)
+        stats_by_label[label] = stats
+
+        model_dir = output_path / _safe_directory_name(label)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = model_dir / "metrics.json"
+        metrics_path.write_text(
+            json.dumps({**stats, "run_metrics": report.metrics}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        figure = _build_model_figure(label, report, max_resumes, max_fields, plt)
+        image_path = model_dir / "performance.png"
+        figure.savefig(image_path, dpi=160, bbox_inches="tight")
+        saved[label] = {"image": str(image_path), "json": str(metrics_path)}
+        if len(entries) > 1:
+            plt.close(figure)
+
+    _print_stats(stats_by_label)
+
+    summary: dict[str, Any] = {
+        "stats": stats_by_label,
+        "saved": saved,
+        "output_dir": str(output_path),
+    }
+    if len(entries) > 1:
+        comparison_figure = _build_comparison_figure(dict(entries), plt)
+        comparison_image = output_path / "comparison.png"
+        comparison_figure.savefig(comparison_image, dpi=160, bbox_inches="tight")
+        comparison_json = output_path / "comparison.json"
+        comparison_json.write_text(
+            json.dumps({"models": stats_by_label}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        summary["comparison"] = {"image": str(comparison_image), "json": str(comparison_json)}
+        if show:
+            plt.show()
+    elif show:
+        plt.show()
+
+    return summary
+
+
 __all__ = [
     "EvaluationItem",
     "EvaluationReport",
@@ -880,4 +1112,6 @@ __all__ = [
     "Evaluator",
     "ModelCallbackOutput",
     "render_json_prompt",
+    "report_results",
+    "strict_json_schema",
 ]
