@@ -151,9 +151,75 @@ def openai_inference(
     return callback
 
 
+def hf_inference(
+    model_name: str,
+    *,
+    max_new_tokens: int = 2048,
+    device: str | None = None,
+) -> ModelCallback:
+    """Return a callback that downloads a Hugging Face model and runs it locally.
+
+    The model is pulled from the Hub on first use (authenticated with ``HF_TOKEN``
+    when set) and cached by ``huggingface_hub``; later calls reuse the loaded
+    pipeline. ``device`` defaults to the best available of cuda, mps, or cpu.
+    """
+    state: dict = {}
+
+    def callback(item: EvaluationItem) -> ModelCallbackOutput:
+        generator = state.get("pipeline")
+        if generator is None:
+            try:
+                import torch
+                from transformers import pipeline as transformers_pipeline
+            except ImportError as error:
+                raise RuntimeError(
+                    "hf_inference needs transformers and torch. Run: pip install -r requirements.txt"
+                ) from error
+
+            resolved_device = device
+            if resolved_device is None:
+                if torch.cuda.is_available():
+                    resolved_device = "cuda"
+                elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+                    resolved_device = "mps"
+                else:
+                    resolved_device = "cpu"
+            generator = transformers_pipeline(
+                "text-generation",
+                model=model_name,
+                device=resolved_device,
+                token=os.getenv("HF_TOKEN"),
+            )
+            state["pipeline"] = generator
+            state["device"] = resolved_device
+
+        prompt = render_json_prompt(item.resume_text)
+        outputs = generator(
+            [{"role": "user", "content": prompt}],
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_full_text=False,
+        )
+        generated = outputs[0]["generated_text"]
+        if isinstance(generated, list):
+            generated = generated[-1].get("content", "") if generated else ""
+        text = (generated or "").strip()
+        if not text:
+            raise RuntimeError("Hugging Face model returned an empty response.")
+        return ModelCallbackOutput(
+            raw_output=text,
+            prompt=prompt,
+            model_name=model_name,
+            metadata={"device": state.get("device"), "max_new_tokens": max_new_tokens},
+        )
+
+    return callback
+
+
 __all__ = [
     "OPENROUTER_URL",
     "OLLAMA_URL",
+    "hf_inference",
     "ollama_inference",
     "openai_inference",
 ]
