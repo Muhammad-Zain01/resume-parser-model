@@ -6,8 +6,9 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -32,7 +33,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.schema.resume_output import ResumeOutput
 
 
-DATA_DIR = PROJECT_ROOT / ".data"
 DEFAULT_PROMPT_PATH = Path(__file__).with_name("evaluation_prompt.md")
 
 # These fields need meaning comparison when normalized exact comparison differs.
@@ -135,7 +135,7 @@ class EvaluationReport:
 
     metrics: dict[str, Any]
     results: list[EvaluationResult]
-    output_dir: Path
+    output_dir: Path | None
     manifest: list[dict[str, Any]]
 
 
@@ -687,7 +687,7 @@ class Evaluator:
         output_dir: Path | str | None = None,
         show_progress: bool = True,
     ) -> EvaluationReport:
-        """Run inference, deterministic scoring, and semantic fallback where needed."""
+        """Run scoring in memory; persist files only when ``output_dir`` is supplied."""
         if workers < 1:
             raise ValueError("workers must be at least 1")
         if test_size is not None:
@@ -705,23 +705,24 @@ class Evaluator:
             selected = random.Random(seed).sample(selected, count)
             selected.sort(key=lambda item: item.resume_id)
 
-        run_dir = Path(output_dir) if output_dir else (
-            DATA_DIR / "evaluation" / datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
-        )
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(output_dir) if output_dir is not None else None
+        if run_dir is not None:
+            run_dir.mkdir(parents=True, exist_ok=True)
         manifest = [
             {"resume_id": item.resume_id, "category": item.category, "metadata": self._json_safe(item.metadata)}
             for item in selected
         ]
-        (run_dir / "test_manifest.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        if run_dir is not None:
+            (run_dir / "test_manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
 
         results: list[EvaluationResult] = []
-        result_path = run_dir / "results.jsonl"
+        result_path = run_dir / "results.jsonl" if run_dir is not None else None
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(self._evaluate_one, item, callback) for item in selected]
-            with result_path.open("w", encoding="utf-8") as handle:
+            write_context = result_path.open("w", encoding="utf-8") if result_path else nullcontext()
+            with write_context as handle:
                 for future in tqdm(
                     as_completed(futures),
                     total=len(futures),
@@ -736,8 +737,9 @@ class Evaluator:
                         except Exception as error:
                             result.error = f"on_result failed: {type(error).__name__}: {error}"
                     results.append(result)
-                    handle.write(json.dumps(self._result_dict(result), ensure_ascii=False) + "\n")
-                    handle.flush()
+                    if handle is not None:
+                        handle.write(json.dumps(self._result_dict(result), ensure_ascii=False) + "\n")
+                        handle.flush()
 
         metrics = self._summarize(results)
         metrics.update({
@@ -746,9 +748,10 @@ class Evaluator:
             "workers": workers,
             "selected_resume_ids": [item.resume_id for item in selected],
         })
-        (run_dir / "metrics.json").write_text(
-            json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        if run_dir is not None:
+            (run_dir / "metrics.json").write_text(
+                json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
         return EvaluationReport(metrics=metrics, results=results, output_dir=run_dir, manifest=manifest)
 
     def _result_dict(self, result: EvaluationResult) -> dict[str, Any]:
@@ -813,7 +816,7 @@ def _report_stats(label: str, report: EvaluationReport) -> dict[str, Any]:
         "mean_identity_score": metrics.get("mean_identity_score"),
         "mean_duration_seconds": (sum(durations) / len(durations)) if durations else None,
         "status_counts": metrics.get("status_counts", {}),
-        "run_output_dir": str(report.output_dir),
+        "run_output_dir": str(report.output_dir) if report.output_dir is not None else None,
     }
 
 
