@@ -243,7 +243,7 @@ def write_jsonl(items: Iterable[CuratedItem], path: Path) -> Path:
     return path
 
 
-def write_dataset_card(summary: dict[str, Any], output_dir: Path = CURATED_DIR) -> Path:
+def write_dataset_card(summary: dict[str, Any], output_dir: Path = DATA_DIR) -> Path:
     """Write a Hugging Face dataset card with the split counts."""
     lines = [
         "---",
@@ -256,6 +256,10 @@ def write_dataset_card(summary: dict[str, Any], output_dir: Path = CURATED_DIR) 
         "# Resume extraction dataset",
         "",
         "Chat-format pairs for fine-tuning models that extract structured JSON from resumes.",
+        "",
+        "The repository preserves the processing stages: `raw/` contains source resume files,",
+        "`extracted/` contains extracted text, `annotated/` contains validated target JSON,",
+        "and `curated/` contains the train, validation, and test splits.",
         "",
         "| split | rows | percentage |",
         "| --- | ---: | ---: |",
@@ -297,22 +301,36 @@ def write_splits(
 
 
 def push_to_hub(
-    folder: Path = CURATED_DIR,
+    folder: Path = DATA_DIR,
     repo_id: str | None = None,
     *,
-    private: bool = True,
+    private: bool = False,
     token: str | None = None,
 ) -> str:
-    """Upload the curated folder to a Hugging Face dataset repository."""
+    """Upload the complete local data pipeline to a Hugging Face dataset repository."""
     try:
         from huggingface_hub import HfApi, create_repo
     except ImportError as error:
         raise RuntimeError(
             "huggingface_hub is required to push datasets. Run: pip install -r requirements.txt"
         ) from error
-    repo_id = repo_id or f"{os.getenv('HF_USERNAME', '')}/resume-curation"
-    if not repo_id or repo_id.startswith("/"):
-        raise RuntimeError("Set HF_USERNAME in .env or pass repo_id explicitly.")
+    repo_id = repo_id or os.getenv("HF_DATASET_REPO", "").strip()
+    if not repo_id:
+        username = os.getenv("HF_USERNAME", "").strip()
+        if not username:
+            raise RuntimeError(
+                "Set HF_DATASET_REPO (owner/repo-name) in .env or pass repo_id explicitly."
+            )
+        repo_id = f"{username}/resume-parser-dataset"
+    elif "/" not in repo_id:
+        username = os.getenv("HF_USERNAME", "").strip()
+        if not username:
+            raise RuntimeError(
+                "Set HF_DATASET_REPO as owner/repo-name, or set HF_USERNAME too."
+            )
+        repo_id = f"{username}/{repo_id}"
+    if repo_id.startswith("/") or repo_id.endswith("/"):
+        raise RuntimeError("HF_DATASET_REPO must be owner/repo-name.")
     token = token or os.getenv("HF_TOKEN")
     if not token:
         raise RuntimeError("HF_TOKEN is missing from the environment or project .env.")
@@ -322,6 +340,7 @@ def push_to_hub(
         repo_id=repo_id,
         repo_type="dataset",
         token=token,
+        ignore_patterns=[".cache/huggingface/**"],
     )
     return f"https://huggingface.co/datasets/{repo_id}"
 
