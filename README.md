@@ -28,6 +28,14 @@ python download_resume_parser_dataset.py
 
 The script downloads the configured dataset into `.data/` and displays a progress bar. It updates files from the remote repository without deleting local-only files.
 
+To upload the complete `.data/` pipeline to the configured public Hugging Face dataset repository, run:
+
+```bash
+python upload_resume_parser_dataset.py
+```
+
+The uploader reports the file count and size, then uses Hugging Face's Xet transfer progress display. It requires a valid `HF_TOKEN` with write access.
+
 ## Dataset sources
 
 - [Mehyaar – Annotated NER PDF Resumes](https://huggingface.co/datasets/Mehyaar/Annotated_NER_PDF_Resumes)
