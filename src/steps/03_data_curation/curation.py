@@ -1,9 +1,8 @@
 """Curate annotated resumes into train/validation/test datasets.
 
 Inputs come from the earlier pipeline steps: extracted resume text (01) and
-schema-validated annotations (02). The test split uses the same sampling call as
-the evaluation notebook, so with matching ``test_size`` and ``seed`` the test
-split is exactly the evaluation sample and training never sees it.
+schema-validated annotations (02). The dataset is split by category into
+train/validation/test partitions using configurable fractions.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ DATA_DIR = PROJECT_ROOT / ".data"
 EXTRACTED_DIR = DATA_DIR / "extracted"
 ANNOTATED_DIR = DATA_DIR / "annotated"
 CURATED_DIR = DATA_DIR / "curated"
+DEFAULT_SPLIT_RATIOS = {"train": 0.85, "validation": 0.05, "test": 0.10}
 
 INSTRUCTION = (
     "You extract structured information from a resume. "
@@ -113,27 +113,90 @@ def load_items(
 def split_pairs(
     pairs: list[str],
     *,
-    test_size: int = 15,
-    validation_size: int = 500,
+    train_fraction: float = DEFAULT_SPLIT_RATIOS["train"],
+    validation_fraction: float = DEFAULT_SPLIT_RATIOS["validation"],
+    test_fraction: float = DEFAULT_SPLIT_RATIOS["test"],
     seed: int = 42,
 ) -> dict[str, list[str]]:
-    """Deterministic pair split with the evaluation sample reserved for test."""
-    if test_size < 1 or validation_size < 0:
-        raise ValueError("test_size must be positive and validation_size non-negative.")
-    if test_size + validation_size > len(pairs):
-        raise ValueError("test_size + validation_size exceeds the number of pairs.")
-    test = random.Random(seed).sample(pairs, test_size)
-    remaining = [pair for pair in pairs if pair not in set(test)]
-    validation = random.Random(seed + 1).sample(remaining, validation_size) if validation_size else []
-    reserved = set(test) | set(validation)
-    train = [pair for pair in pairs if pair not in reserved]
-    return {"train": train, "validation": validation, "test": test}
+    """Create deterministic, approximately stratified splits by resume category."""
+    ratios = {
+        "train": train_fraction,
+        "validation": validation_fraction,
+        "test": test_fraction,
+    }
+    if any(ratio < 0 or ratio > 1 for ratio in ratios.values()):
+        raise ValueError("Split fractions must be between 0 and 1.")
+    if train_fraction <= 0 or abs(sum(ratios.values()) - 1.0) > 1e-8:
+        raise ValueError("Split fractions must sum to 1 and train_fraction must be positive.")
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("pairs must not contain duplicate paths.")
+
+    by_category: dict[str, list[str]] = {}
+    for pair in pairs:
+        category = Path(pair).parent.as_posix()
+        by_category.setdefault(category, []).append(pair)
+
+    category_names = sorted(by_category)
+    total = len(pairs)
+    raw_totals = {name: total * ratio for name, ratio in ratios.items()}
+    target_totals = {name: int(count) for name, count in raw_totals.items()}
+    remaining = total - sum(target_totals.values())
+    split_order = sorted(
+        ratios,
+        key=lambda name: (raw_totals[name] - target_totals[name], name),
+        reverse=True,
+    )
+    for name in split_order[:remaining]:
+        target_totals[name] += 1
+
+    # Largest-remainder allocation keeps each category represented in roughly
+    # the same proportions while preserving exact overall split sizes.
+    raw_test = {name: len(by_category[name]) * test_fraction for name in category_names}
+    test_counts = {name: int(count) for name, count in raw_test.items()}
+    for name in sorted(
+        category_names,
+        key=lambda category: (raw_test[category] - test_counts[category], category),
+        reverse=True,
+    )[: target_totals["test"] - sum(test_counts.values())]:
+        test_counts[name] += 1
+
+    remaining_sizes = {
+        name: len(by_category[name]) - test_counts[name]
+        for name in category_names
+    }
+    remaining_fraction = validation_fraction / (train_fraction + validation_fraction)
+    raw_validation = {
+        name: remaining_sizes[name] * remaining_fraction for name in category_names
+    }
+    validation_counts = {name: int(count) for name, count in raw_validation.items()}
+    for name in sorted(
+        category_names,
+        key=lambda category: (
+            raw_validation[category] - validation_counts[category], category
+        ),
+        reverse=True,
+    )[: target_totals["validation"] - sum(validation_counts.values())]:
+        validation_counts[name] += 1
+
+    splits = {name: [] for name in ratios}
+    rng = random.Random(seed)
+    for category in category_names:
+        category_pairs = by_category[category]
+        rng.shuffle(category_pairs)
+        test_end = test_counts[category]
+        validation_end = test_end + validation_counts[category]
+        splits["test"].extend(category_pairs[:test_end])
+        splits["validation"].extend(category_pairs[test_end:validation_end])
+        splits["train"].extend(category_pairs[validation_end:])
+
+    return splits
 
 
 def build_dataset(
     *,
-    test_size: int = 15,
-    validation_size: int = 500,
+    train_fraction: float = DEFAULT_SPLIT_RATIOS["train"],
+    validation_fraction: float = DEFAULT_SPLIT_RATIOS["validation"],
+    test_fraction: float = DEFAULT_SPLIT_RATIOS["test"],
     seed: int = 42,
     extracted_dir: Path = EXTRACTED_DIR,
     annotated_dir: Path = ANNOTATED_DIR,
@@ -141,8 +204,9 @@ def build_dataset(
     """Pair, split, then load and validate every target."""
     pair_splits = split_pairs(
         pair_paths(extracted_dir, annotated_dir),
-        test_size=test_size,
-        validation_size=validation_size,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+        test_fraction=test_fraction,
         seed=seed,
     )
     splits: dict[str, list[CuratedItem]] = {}
@@ -156,14 +220,16 @@ def build_dataset(
 
 def summarize(splits: dict[str, list[CuratedItem]]) -> dict[str, Any]:
     """Row counts per split and category spread."""
+    total = sum(len(items) for items in splits.values())
     summary: dict[str, Any] = {
         name: {
             "count": len(items),
+            "percentage": round(100 * len(items) / total, 3) if total else 0.0,
             "categories": dict(sorted(Counter(item.category for item in items).items())),
         }
         for name, items in splits.items()
     }
-    summary["total"] = sum(len(items) for items in splits.values())
+    summary["total"] = total
     return summary
 
 
@@ -191,19 +257,20 @@ def write_dataset_card(summary: dict[str, Any], output_dir: Path = CURATED_DIR) 
         "",
         "Chat-format pairs for fine-tuning models that extract structured JSON from resumes.",
         "",
-        "| split | rows |",
-        "| --- | ---: |",
+        "| split | rows | percentage |",
+        "| --- | ---: | ---: |",
     ]
     for name in ("train", "validation", "test"):
         if name in summary:
-            lines.append(f"| {name} | {summary[name]['count']:,} |")
+            lines.append(
+                f"| {name} | {summary[name]['count']:,} | {summary[name]['percentage']:.3f}% |"
+            )
     lines.extend((
         "",
         "Each record has `resume_id`, `category`, and `messages` ",
         "(system instruction, resume text, target JSON).",
         "",
-        "The test split matches the project's evaluation sample, so reported ",
-        "evaluation scores stay comparable with models trained on this dataset.",
+        "The test split is held out from training and validation for final evaluation.",
         "",
     ))
     path = Path(output_dir) / "README.md"
