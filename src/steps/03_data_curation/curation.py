@@ -53,18 +53,12 @@ class CuratedItem:
     target: dict[str, Any]
 
     def to_record(self) -> dict[str, Any]:
-        """Render one chat-format training record."""
+        """Render one model-independent input/target record."""
         return {
             "resume_id": self.resume_id,
             "category": self.category,
-            "messages": [
-                {"role": "system", "content": INSTRUCTION},
-                {"role": "user", "content": self.resume_text},
-                {
-                    "role": "assistant",
-                    "content": json.dumps(self.target, ensure_ascii=False, separators=(",", ":")),
-                },
-            ],
+            "resume_text": self.resume_text,
+            "target_json": self.target,
         }
 
 
@@ -280,19 +274,20 @@ def write_dataset_card(summary: dict[str, Any], output_dir: Path = DATA_DIR) -> 
         "| `raw/` | Original source resumes, organized by occupation/category. |",
         "| `extracted/` | Text extracted from each source file; image-only or failed extractions may be represented by a status marker. |",
         "| `annotated/` | Resume-level target JSON, validated against the project's Pydantic schema. |",
-        "| `curated/` | Chat-format JSONL records and split statistics for model training and evaluation. |",
+        "| `curated/` | JSONL records with separate resume text and target JSON fields, plus split statistics. |",
         "",
         "Resume files and their derived text/annotations use matching category folders and resume IDs so the processing trail can be followed across stages.",
         "",
         "## Training example format",
         "",
-        "Each JSONL record contains `resume_id`, `category`, and `messages`:",
+        "Each JSONL record contains four top-level fields:",
         "",
-        "- `system`: extraction instructions and rules for missing values.",
-        "- `user`: extracted resume text supplied as model input.",
-        "- `assistant`: the target JSON object supplied as the expected output.",
+        "- `resume_id`: the stable resume identifier shared across processing stages.",
+        "- `category`: the resume's occupation/category label.",
+        "- `resume_text`: the extracted text used as model input (X).",
+        "- `target_json`: the schema-validated JSON object used as the expected output (Y).",
         "",
-        "The target follows the project's [`ResumeOutput` Pydantic schema](https://github.com/Muhammad-Zain01/resume-parser-model/blob/main/src/schema/resume_output.py). It covers contact details, professional summary and objectives, roles, work history, education, skills, certifications, projects, awards, publications, volunteering, memberships, references, and additional sections. Missing scalar values use `null`; missing collections use empty lists.",
+        "The target follows the project's [`ResumeOutput` Pydantic schema](https://github.com/Muhammad-Zain01/resume-parser-model/blob/main/src/schema/resume_output.py). It covers contact details, professional summary and objectives, roles, work history, education, skills, certifications, projects, awards, publications, volunteering, memberships, references, and additional sections. Missing scalar values use `null`; missing collections use empty lists. Convert these fields to a model-specific prompt or chat format during training preprocessing as needed.",
         "",
         "## Dataset splits",
         "",
