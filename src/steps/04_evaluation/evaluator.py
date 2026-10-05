@@ -726,7 +726,11 @@ class Evaluator:
         output_dir: Path | str | None = None,
         show_progress: bool = True,
     ) -> EvaluationReport:
-        """Run scoring in memory; persist files only when ``output_dir`` is supplied."""
+        """Evaluate the selected resumes and return the report in memory.
+
+        When ``output_dir`` is supplied, write the manifest, results, and metrics
+        there. No files are written by default.
+        """
         if workers < 1:
             raise ValueError("workers must be at least 1")
         if test_size is not None:
@@ -791,7 +795,12 @@ class Evaluator:
             (run_dir / "metrics.json").write_text(
                 json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-        return EvaluationReport(metrics=metrics, results=results, output_dir=run_dir, manifest=manifest)
+        return EvaluationReport(
+            metrics=metrics,
+            results=results,
+            output_dir=run_dir,
+            manifest=manifest,
+        )
 
     def _result_dict(self, result: EvaluationResult) -> dict[str, Any]:
         return {
