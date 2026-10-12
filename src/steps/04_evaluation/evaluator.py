@@ -223,6 +223,50 @@ def strict_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     return transform(dict(schema))
 
 
+def extract_json_object(text: str) -> str:
+    """Return the JSON object embedded in ``text``.
+
+    Models often wrap their JSON in a Markdown code fence or add a short
+    preamble. This strips a fenced block when present and otherwise returns the
+    first balanced ``{...}`` object. Text that is already valid JSON is returned
+    unchanged, so valid inputs never change meaning.
+    """
+    stripped = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", stripped, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        stripped = fenced.group(1).strip()
+    try:
+        json.loads(stripped)
+        return stripped
+    except json.JSONDecodeError:
+        pass
+
+    start = stripped.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(stripped)):
+        character = stripped[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return stripped[start:index + 1]
+    return text
+
+
 def _normalise_date(value: str) -> str:
     text = value.strip().casefold()
     if text in {"present", "current", "now", "ongoing"}:
@@ -343,7 +387,7 @@ class Evaluator:
     @staticmethod
     def _json_value(value: Any) -> Any:
         if isinstance(value, str):
-            return json.loads(value)
+            return json.loads(extract_json_object(value))
         if isinstance(value, BaseModel):
             return value.model_dump(mode="json")
         if isinstance(value, Mapping):
@@ -1209,6 +1253,7 @@ __all__ = [
     "EvaluationSummary",
     "Evaluator",
     "ModelCallbackOutput",
+    "extract_json_object",
     "render_json_prompt",
     "report_results",
     "strict_json_schema",
