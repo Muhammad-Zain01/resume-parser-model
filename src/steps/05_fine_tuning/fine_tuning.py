@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
 import json
+import math
 import os
 import random
 import re
 import sys
+import shutil
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
@@ -102,7 +106,9 @@ def model_repo_id(repo_id: str | None = None) -> str:
     return HF_MODEL_REPO
 
 
-def checkpoint_revision(num_resumes: int, *, steps: int | None = None, prefix: str = "trained") -> str:
+def checkpoint_revision(
+    num_resumes: int, *, steps: int | None = None, prefix: str = "trained", run_tag: str | None = None
+) -> str:
     """Build a revision/branch name that records how much training it holds.
 
     Use it as the ``revision`` when pushing so each training batch lands on its
@@ -111,9 +117,13 @@ def checkpoint_revision(num_resumes: int, *, steps: int | None = None, prefix: s
     if num_resumes < 0:
         raise ValueError("num_resumes must be non-negative.")
     revision = f"{prefix}-{num_resumes}"
+    if run_tag:
+        revision += f"-{run_tag}"
     if steps is not None:
+        if steps < 0:
+            raise ValueError("steps must be non-negative.")
         revision += f"-steps-{steps}"
-    return re.sub(r"[^0-9A-Za-z._-]+", "-", revision).strip("-_") or prefix
+    return re.sub(r"[^0-9A-Za-z_-]+", "-", revision).strip("-_") or "trained"
 
 
 def _ensure_revision(repo_id: str, revision: str | None, repo_type: str, token: str) -> None:
@@ -148,26 +158,25 @@ def download_split(split: str, *, curated_dir: Path | str = CURATED_DIR, force: 
     revision = (os.getenv("HF_DATASET_REVISION") or "main").strip() or "main"
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        hf_hub_download(
+        downloaded = hf_hub_download(
             repo_id=repo_id,
             repo_type="dataset",
             revision=revision,
             filename=f"curated/{filename}",
-            local_dir=str(PROJECT_ROOT / ".data"),
+            force_download=force,
             token=_hf_token(),
         )
     except EntryNotFoundError:
         # Support the earlier layout where split files sit at the repo root.
-        hf_hub_download(
+        downloaded = hf_hub_download(
             repo_id=repo_id,
             repo_type="dataset",
             revision=revision,
             filename=filename,
-            local_dir=str(destination.parent),
+            force_download=force,
             token=_hf_token(),
         )
-    if not destination.is_file():
-        raise FileNotFoundError(f"Split {split!r} was not written to {destination}.")
+    shutil.copyfile(downloaded, destination)
     return destination
 
 
@@ -196,6 +205,153 @@ def _record_digest(record: dict[str, Any]) -> str:
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
+def _text_digest(record: dict[str, Any]) -> str:
+    # Whitespace differences do not make the same resume an independent example.
+    text = " ".join(record["resume_text"].split())
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _validate_records(records: list[dict[str, Any]], split: str) -> None:
+    if not records:
+        raise ValueError(f"{split} has no records.")
+    for index, record in enumerate(records):
+        text = record.get("resume_text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{split} record {index} has no usable resume_text.")
+        if not str(record.get("resume_id") or "").strip():
+            raise ValueError(f"{split} record {index} has no resume_id.")
+        try:
+            ResumeOutput.model_validate(record.get("target_json"))
+        except Exception:
+            # Do not include private field values from a Pydantic error in logs.
+            raise ValueError(f"{split} record {index} has an invalid target_json.") from None
+
+
+def _deduplicate_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        groups.setdefault(_text_digest(record), []).append(record)
+    kept = []
+    duplicates = conflicts = 0
+    for group in groups.values():
+        targets = {json.dumps(r["target_json"], sort_keys=True, ensure_ascii=False) for r in group}
+        if len(targets) > 1:
+            conflicts += len(group)
+        else:
+            kept.append(group[0])
+            duplicates += len(group) - 1
+    return kept, {"duplicate_rows_removed": duplicates, "conflicting_rows_removed": conflicts}
+
+
+def prepare_training_records(
+    train_records: list[dict[str, Any]],
+    validation_records: list[dict[str, Any]],
+    *,
+    test_records: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Validate records and exclude duplicate/conflicting text and held-out leakage.
+
+    Original files are preserved. Test records only reserve identities/text; they
+    are never used as training targets. Validation takes precedence over training.
+    """
+    _validate_records(train_records, "train")
+    _validate_records(validation_records, "validation")
+    if test_records is not None:
+        _validate_records(test_records, "test")
+    reserved = list(test_records or [])
+    test_text = {_text_digest(r) for r in reserved}
+    test_ids = {str(r["resume_id"]) for r in reserved}
+    validation = [r for r in validation_records
+                  if _text_digest(r) not in test_text and str(r["resume_id"]) not in test_ids]
+    validation, validation_report = _deduplicate_records(validation)
+    # Reserve even excluded/conflicting validation rows to avoid moving held-out
+    # material into training as an accidental consequence of cleaning.
+    reserved += validation_records
+    heldout_text = {_text_digest(r) for r in reserved}
+    heldout_ids = {str(r["resume_id"]) for r in reserved}
+    train = [r for r in train_records
+             if _text_digest(r) not in heldout_text and str(r["resume_id"]) not in heldout_ids]
+    train_overlap = len(train_records) - len(train)
+    train, train_report = _deduplicate_records(train)
+    _validate_records(train, "prepared train")
+    _validate_records(validation, "prepared validation")
+    report = {
+        "train": {"input_rows": len(train_records), "heldout_overlap_removed": train_overlap,
+                  **train_report, "kept_rows": len(train)},
+        "validation": {"input_rows": len(validation_records),
+                       "test_overlap_removed": len(validation_records) - len(validation)
+                       - sum(validation_report.values()),
+                       **validation_report, "kept_rows": len(validation)},
+        "test_overlap_checked": test_records is not None,
+    }
+    return train, validation, report
+
+
+def select_training_records(
+    records: list[dict[str, Any]], max_train: int | None, *, seed: int = 42
+) -> list[dict[str, Any]]:
+    """Select a reproducible proportional subset with category coverage."""
+    if max_train is not None and (
+        isinstance(max_train, bool) or not isinstance(max_train, int) or max_train < 1
+    ):
+        raise ValueError("max_train must be a positive integer or None.")
+    rng = random.Random(seed)
+    if max_train is None or max_train >= len(records):
+        selected = list(records)
+    else:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            groups.setdefault(str(record.get("category")), []).append(record)
+        categories = sorted(groups)
+        minimum = int(max_train >= len(categories))
+        counts = {c: minimum for c in categories}
+        available = sum(len(groups[c]) - minimum for c in categories)
+        remaining = max_train - minimum * len(categories)
+        quotas = {c: remaining * (len(groups[c]) - minimum) / available for c in categories}
+        for c in categories:
+            counts[c] += math.floor(quotas[c])
+        remainder = max_train - sum(counts.values())
+        for c in sorted(categories, key=lambda c: (-(quotas[c] % 1), c))[:remainder]:
+            counts[c] += 1
+        selected = [r for c in categories for r in rng.sample(groups[c], counts[c])]
+    rng.shuffle(selected)
+    return selected
+
+
+def _example_token_ids(example: dict[str, Any], tokenizer: Any) -> list[int]:
+    return tokenizer.apply_chat_template(
+        example["prompt"] + example["completion"], tokenize=True, add_generation_prompt=False,
+        return_dict=False,
+    )
+
+
+def filter_records_by_length(
+    records: list[dict[str, Any]], tokenizer: Any, *, max_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    policy: str = "error",
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Check every chat-formatted example; never truncate target JSON."""
+    if max_length < 1 or policy not in {"error", "drop"}:
+        raise ValueError("Use a positive max_length and policy='error' or 'drop'.")
+    kept = []
+    longest = 0
+    for record in records:
+        example = build_training_examples([record])[0]
+        length = len(_example_token_ids(example, tokenizer))
+        longest = max(longest, length)
+        if length <= max_length:
+            kept.append(record)
+    report = {"input_rows": len(records), "over_max_length": len(records) - len(kept),
+              "kept_rows": len(kept), "max": longest, "max_length": max_length}
+    if report["over_max_length"] and policy == "error":
+        raise ValueError(
+            f"{report['over_max_length']} examples exceed {max_length} tokens (longest: {longest}). "
+            "Increase the context budget or explicitly filter with policy='drop'; JSON is not truncated."
+        )
+    if not kept:
+        raise ValueError("No examples fit the context budget.")
+    return kept, report
+
+
 def _percentile(values: list[int], fraction: float) -> int | None:
     if not values:
         return None
@@ -217,10 +373,8 @@ def token_length_report(
     if sample is not None and sample < len(records):
         rows = random.Random(42).sample(records, sample)
     lengths: list[int] = []
-    for record in rows:
-        prompt = prompt_fn(record.get("resume_text", ""))
-        completion = json.dumps(record.get("target_json"), ensure_ascii=False)
-        lengths.append(len(tokenizer(prompt + "\n" + completion, add_special_tokens=False)["input_ids"]))
+    for example in build_training_examples(rows, prompt_fn=prompt_fn):
+        lengths.append(len(_example_token_ids(example, tokenizer)))
     return {
         "sampled": len(rows),
         "min": min(lengths) if lengths else None,
@@ -286,7 +440,7 @@ def build_training_examples(
     *,
     prompt_fn: Callable[[str], str] = render_json_prompt,
 ) -> list[dict[str, Any]]:
-    """Convert curated records into chat-format examples.
+    """Convert records into conversational prompt/completion examples.
 
     The user turn reuses the evaluation prompt so training and evaluation share
     one format; the assistant turn is the compact target JSON.
@@ -297,10 +451,8 @@ def build_training_examples(
         completion = json.dumps(record.get("target_json"), ensure_ascii=False)
         examples.append(
             {
-                "messages": [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": completion},
-                ]
+                "prompt": [{"role": "user", "content": prompt}],
+                "completion": [{"role": "assistant", "content": completion}],
             }
         )
     return examples
@@ -310,14 +462,23 @@ def build_datasets(
     train_records: list[dict[str, Any]],
     validation_records: list[dict[str, Any]],
     *,
+    tokenizer: Any,
     max_train: int | None = None,
+    max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
+    seed: int = 42,
+    test_records: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, Any]:
     """Build Hugging Face ``Dataset`` objects for training and evaluation."""
     from datasets import Dataset
 
-    train_examples = build_training_examples(train_records)
-    if max_train is not None:
-        train_examples = train_examples[:max_train]
+    train_records, validation_records, cleaning = prepare_training_records(
+        train_records, validation_records, test_records=test_records
+    )
+    if len(train_records) != cleaning["train"]["input_rows"] or len(validation_records) != cleaning["validation"]["input_rows"]:
+        warnings.warn(f"Dataset preparation excluded rows: {cleaning}", stacklevel=2)
+    train_records, _ = filter_records_by_length(train_records, tokenizer, max_length=max_seq_length)
+    validation_records, _ = filter_records_by_length(validation_records, tokenizer, max_length=max_seq_length)
+    train_examples = build_training_examples(select_training_records(train_records, max_train, seed=seed))
     validation_examples = build_training_examples(validation_records)
     return Dataset.from_list(train_examples), Dataset.from_list(validation_examples)
 
@@ -331,21 +492,30 @@ def load_model_and_tokenizer(
     model_id: str = DEFAULT_MODEL_ID,
     *,
     load_in_4bit: bool = True,
-    device_map: str = "auto",
+    device_map: Any | None = None,
     compute_dtype: Any | None = None,
 ) -> tuple[Any, Any]:
     """Load the base model (4-bit by default) and its chat tokenizer."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+    cuda = torch.cuda.is_available()
+    if load_in_4bit and not cuda:
+        raise RuntimeError("This QLoRA workflow requires a CUDA GPU. Select a GPU runtime in Colab.")
+    if compute_dtype is None:
+        compute_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if cuda else torch.float32
+    if compute_dtype == torch.bfloat16 and cuda and not torch.cuda.is_bf16_supported():
+        raise ValueError("This GPU does not support bf16; use float16.")
+    if device_map is None:
+        device_map = {"": torch.cuda.current_device()} if cuda else {"": "cpu"}
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=_hf_token())
+    if not tokenizer.chat_template:
+        raise ValueError("The tokenizer must provide a chat template.")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
     if load_in_4bit:
-        if compute_dtype is None:
-            compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             quantization_config=BitsAndBytesConfig(
@@ -355,12 +525,13 @@ def load_model_and_tokenizer(
                 bnb_4bit_use_double_quant=True,
             ),
             device_map=device_map,
+            dtype=compute_dtype,
             token=_hf_token(),
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=torch.bfloat16,
+            dtype=compute_dtype,
             device_map=device_map,
             token=_hf_token(),
         )
@@ -378,6 +549,8 @@ def build_lora_config(
     """Build the PEFT LoRA configuration for QLoRA."""
     from peft import LoraConfig
 
+    if r < 1 or alpha < 1 or not 0 <= dropout < 1:
+        raise ValueError("LoRA requires positive r/alpha and dropout in [0, 1).")
     return LoraConfig(
         r=r,
         lora_alpha=alpha,
@@ -432,22 +605,43 @@ def build_training_arguments(
     gradient_checkpointing: bool = True,
     bf16: bool | None = None,
     seed: int = 42,
+    per_device_eval_batch_size: int = 1,
 ) -> Any:
     """Build ``SFTConfig`` for a QLoRA run with periodic checkpoints."""
     import torch
     from trl import SFTConfig
 
+    if epochs <= 0 or learning_rate <= 0 or not 0 <= warmup_ratio < 1:
+        raise ValueError("Use positive epochs/learning_rate and warmup_ratio in [0, 1).")
+    for name, value in {
+        "per_device_batch_size": per_device_batch_size,
+        "per_device_eval_batch_size": per_device_eval_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "max_seq_length": max_seq_length, "save_steps": save_steps, "eval_steps": eval_steps,
+        "logging_steps": logging_steps, "save_total_limit": save_total_limit,
+    }.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer.")
+    cuda = torch.cuda.is_available()
+    bf16_supported = cuda and torch.cuda.is_bf16_supported()
     if bf16 is None:
-        bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        bf16 = bf16_supported
+    if bf16 and not bf16_supported:
+        raise ValueError("bf16 was requested but this CUDA device does not support it.")
+    fields = inspect.signature(SFTConfig).parameters
+    if "max_length" not in fields or "completion_only_loss" not in fields:
+        raise RuntimeError("Unsupported TRL version. Install the project's pinned requirements and restart the kernel.")
+    warmup = {"warmup_ratio": warmup_ratio} if "warmup_ratio" in fields else {"warmup_steps": warmup_ratio}
 
     return SFTConfig(
         output_dir=str(output_dir),
         num_train_epochs=epochs,
         per_device_train_batch_size=per_device_batch_size,
+        per_device_eval_batch_size=per_device_eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         lr_scheduler_type=lr_scheduler_type,
-        warmup_ratio=warmup_ratio,
+        **warmup,
         logging_steps=logging_steps,
         save_strategy="steps",
         save_steps=save_steps,
@@ -455,9 +649,12 @@ def build_training_arguments(
         eval_strategy="steps",
         eval_steps=eval_steps,
         bf16=bf16,
-        fp16=not bf16,
+        fp16=cuda and not bf16,
         gradient_checkpointing=gradient_checkpointing,
-        max_seq_length=max_seq_length,
+        gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
+        max_length=max_seq_length,
+        completion_only_loss=True,
+        prediction_loss_only=True,
         packing=False,
         report_to="wandb" if use_wandb else "none",
         run_name=run_name,
@@ -478,6 +675,17 @@ def train(
     """Run Supervised Fine-Tuning and return the trainer."""
     from trl import SFTTrainer
 
+    if lora_config is not None and (
+        getattr(model, "peft_config", None)
+        or any(hasattr(layer, "lora_A") for layer in model.modules())
+    ):
+        raise ValueError("This model already has adapters. Reload the base model for an independent run.")
+    if not len(train_dataset) or not len(eval_dataset):
+        raise ValueError("Training and evaluation datasets must both be non-empty.")
+    if not getattr(training_args, "completion_only_loss", False):
+        raise ValueError("Use completion_only_loss=True with the prepared prompt/completion datasets.")
+    # A constructor failure must propagate with its original traceback. Retrying
+    # may attach adapters twice and hide the actual preprocessing/config error.
     common = {
         "model": model,
         "args": training_args,
@@ -485,11 +693,7 @@ def train(
         "eval_dataset": eval_dataset,
         "peft_config": lora_config,
     }
-    try:
-        trainer = SFTTrainer(processing_class=tokenizer, **common)
-    except TypeError:
-        # Older trl versions accepted ``tokenizer`` instead of ``processing_class``.
-        trainer = SFTTrainer(tokenizer=tokenizer, **common)
+    trainer = SFTTrainer(processing_class=tokenizer, **common)
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     return trainer
 
@@ -519,6 +723,9 @@ def make_generation_callback(
     """Return a callback that generates schema JSON with the tuned model."""
     import torch
 
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive.")
+
     def callback(item: EvaluationItem) -> ModelCallbackOutput:
         prompt = render_json_prompt(item.resume_text)
         text = tokenizer.apply_chat_template(
@@ -526,14 +733,24 @@ def make_generation_callback(
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        with torch.inference_mode():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            )
+        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(model.device)
+        context_limit = getattr(model.config, "max_position_embeddings", None)
+        if context_limit and inputs["input_ids"].shape[1] + max_new_tokens > context_limit:
+            raise ValueError("Prompt plus max_new_tokens exceeds the model context window; generation was not truncated.")
+        was_training = model.training
+        try:
+            model.eval()
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+        finally:
+            model.train(was_training)
         generated = tokenizer.decode(
             output_ids[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         ).strip()
@@ -557,6 +774,7 @@ def evaluate_records(
     max_new_tokens: int = 3072,
     seed: int = 42,
     show_progress: bool = True,
+    output_dir: Path | str | None = None,
 ) -> Any:
     """Score the tuned model on curated records using the step-04 evaluator."""
     items = [
@@ -578,6 +796,7 @@ def evaluate_records(
         test_size=limit,
         seed=seed,
         show_progress=show_progress,
+        output_dir=output_dir,
     )
 
 
@@ -647,7 +866,7 @@ def push_checkpoint_folder(
 
 
 def free_memory() -> None:
-    """Release Python and CUDA memory between runs."""
+    """Collect unused objects/cache after callers delete live model/trainer references."""
     gc.collect()
     try:
         import torch
@@ -683,13 +902,16 @@ __all__ = [
     "download_split",
     "evaluate_records",
     "free_memory",
+    "filter_records_by_length",
     "load_model_and_tokenizer",
     "load_records",
     "make_generation_callback",
     "model_repo_id",
     "push_adapter_to_hub",
     "push_checkpoint_folder",
+    "prepare_training_records",
     "save_adapter",
+    "select_training_records",
     "token_length_report",
     "train",
     "verify_dataset",
