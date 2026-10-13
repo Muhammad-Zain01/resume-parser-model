@@ -3,8 +3,8 @@
 Step 05 owns the fine-tuning workflow:
 
 - download and verify the curated splits from the Hugging Face dataset repo;
-- build chat-format training examples that use the *same* prompt as evaluation,
-  so post-fine-tuning scores stay comparable to the pre-fine-tuning baseline;
+- build chat-format training examples that reuse the evaluation prompt (a
+  before/after comparison also requires identical held-out examples/settings);
 - load the base model in 4-bit (QLoRA) and attach LoRA adapters;
 - train with Weights & Biases tracking and resumable checkpoints;
 - evaluate checkpoints with the step-04 evaluator;
@@ -148,7 +148,7 @@ def download_split(split: str, *, curated_dir: Path | str = CURATED_DIR, force: 
     if filename is None:
         raise ValueError(f"Unknown split {split!r}; expected one of {sorted(SPLIT_FILENAMES)}.")
     destination = Path(curated_dir) / filename
-    if destination.is_file() and not force:
+    if destination.is_file() and not force and not os.getenv("HF_DATASET_REVISION"):
         return destination
 
     from huggingface_hub import hf_hub_download
@@ -176,7 +176,9 @@ def download_split(split: str, *, curated_dir: Path | str = CURATED_DIR, force: 
             force_download=force,
             token=_hf_token(),
         )
-    shutil.copyfile(downloaded, destination)
+    temporary = destination.with_suffix(".jsonl.tmp")
+    shutil.copyfile(downloaded, temporary)
+    temporary.replace(destination)
     return destination
 
 
@@ -503,8 +505,8 @@ def load_model_and_tokenizer(
     if load_in_4bit and not cuda:
         raise RuntimeError("This QLoRA workflow requires a CUDA GPU. Select a GPU runtime in Colab.")
     if compute_dtype is None:
-        compute_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if cuda else torch.float32
-    if compute_dtype == torch.bfloat16 and cuda and not torch.cuda.is_bf16_supported():
+        compute_dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation=False) else torch.float16) if cuda else torch.float32
+    if compute_dtype == torch.bfloat16 and cuda and not torch.cuda.is_bf16_supported(including_emulation=False):
         raise ValueError("This GPU does not support bf16; use float16.")
     if device_map is None:
         device_map = {"": torch.cuda.current_device()} if cuda else {"": "cpu"}
@@ -623,7 +625,7 @@ def build_training_arguments(
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer.")
     cuda = torch.cuda.is_available()
-    bf16_supported = cuda and torch.cuda.is_bf16_supported()
+    bf16_supported = cuda and torch.cuda.is_bf16_supported(including_emulation=False)
     if bf16 is None:
         bf16 = bf16_supported
     if bf16 and not bf16_supported:
@@ -684,6 +686,17 @@ def train(
         raise ValueError("Training and evaluation datasets must both be non-empty.")
     if not getattr(training_args, "completion_only_loss", False):
         raise ValueError("Use completion_only_loss=True with the prepared prompt/completion datasets.")
+    if resume_from_checkpoint:
+        if resume_from_checkpoint is True:
+            from transformers.trainer_utils import get_last_checkpoint
+
+            resume_from_checkpoint = get_last_checkpoint(training_args.output_dir)
+            if resume_from_checkpoint is None:
+                raise ValueError("No resumable checkpoint exists in this experiment's output directory.")
+        checkpoint = Path(resume_from_checkpoint)
+        required = ("trainer_state.json", "optimizer.pt", "scheduler.pt")
+        if any(not (checkpoint / filename).is_file() for filename in required):
+            raise ValueError("Resume requires a full Trainer checkpoint with optimizer/scheduler state, not an adapter export.")
     # A constructor failure must propagate with its original traceback. Retrying
     # may attach adapters twice and hide the actual preprocessing/config error.
     common = {
@@ -694,6 +707,15 @@ def train(
         "peft_config": lora_config,
     }
     trainer = SFTTrainer(processing_class=tokenizer, **common)
+    # Recent TRL versions cast quantized-model adapters to bf16 even when the
+    # run uses fp16 (e.g. on a T4). Keep FP32 adapter gradients for FP16 scaling;
+    # forward operations still use the Trainer's FP16 autocast context.
+    if getattr(training_args, "fp16", False) and getattr(trainer.model, "peft_config", None):
+        import torch
+
+        for parameter in trainer.model.parameters():
+            if parameter.requires_grad:
+                parameter.data = parameter.data.to(torch.float32)
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     return trainer
 
