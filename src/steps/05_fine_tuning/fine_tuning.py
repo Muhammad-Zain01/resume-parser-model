@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -53,6 +54,12 @@ render_json_prompt = _evaluation.render_json_prompt
 DATA_DIR = PROJECT_ROOT / ".data"
 CURATED_DIR = DATA_DIR / "curated"
 
+# Hugging Face account used for the dataset source and the model destination.
+# Use your own username please.
+HF_USERNAME = "md-zain"
+HF_DATASET_REPO = f"{HF_USERNAME}/resume-parser-dataset"
+HF_MODEL_REPO = f"{HF_USERNAME}/resume-parser-qwen2.5-3b"
+
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 DEFAULT_MAX_SEQ_LENGTH = 8192
 DEFAULT_SPLITS = ("train", "validation")
@@ -81,34 +88,43 @@ def _hf_token() -> str | None:
     return None
 
 
-def _resolve_repo_id(env_var: str, default_name: str) -> str:
-    """Resolve an owner/name repo id from an env var with legacy support."""
-    repo_id = (os.getenv(env_var) or "").strip()
-    if not repo_id:
-        username = (os.getenv("HF_USERNAME") or "").strip()
-        if not username:
-            raise RuntimeError(f"Set {env_var}=owner/name in .env.")
-        repo_id = f"{username}/{default_name}"
-    elif "/" not in repo_id:
-        username = (os.getenv("HF_USERNAME") or "").strip()
-        if not username:
-            raise RuntimeError(f"{env_var} must be owner/name, or set HF_USERNAME.")
-        repo_id = f"{username}/{repo_id}"
-    if repo_id.startswith("/") or repo_id.endswith("/") or repo_id.count("/") != 1:
-        raise RuntimeError(f"{env_var} must use the format owner/name.")
-    return repo_id
-
-
-def dataset_repo_id() -> str:
-    """Resolve the Hugging Face dataset repository id."""
-    return _resolve_repo_id("HF_DATASET_REPO", "resume-parser-dataset")
+def dataset_repo_id(repo_id: str | None = None) -> str:
+    """Return the dataset repo id (code-level default; no env needed)."""
+    if repo_id and repo_id.strip():
+        return repo_id.strip()
+    return HF_DATASET_REPO
 
 
 def model_repo_id(repo_id: str | None = None) -> str:
-    """Resolve the Hugging Face model repository id used for adapters."""
+    """Return the model repo id for adapters (code-level default; no env needed)."""
     if repo_id and repo_id.strip():
         return repo_id.strip()
-    return _resolve_repo_id("HF_MODEL_REPO", "resume-parser-qwen2.5-3b")
+    return HF_MODEL_REPO
+
+
+def checkpoint_revision(num_resumes: int, *, steps: int | None = None, prefix: str = "trained") -> str:
+    """Build a revision/branch name that records how much training it holds.
+
+    Use it as the ``revision`` when pushing so each training batch lands on its
+    own branch (for example ``trained-2000`` or ``trained-2000-steps-250``).
+    """
+    if num_resumes < 0:
+        raise ValueError("num_resumes must be non-negative.")
+    revision = f"{prefix}-{num_resumes}"
+    if steps is not None:
+        revision += f"-steps-{steps}"
+    return re.sub(r"[^0-9A-Za-z._-]+", "-", revision).strip("-_") or prefix
+
+
+def _ensure_revision(repo_id: str, revision: str | None, repo_type: str, token: str) -> None:
+    """Create the target branch/revision on the Hub if it does not exist yet."""
+    if not revision or revision == "main":
+        return
+    from huggingface_hub import HfApi
+
+    HfApi().create_branch(
+        repo_id=repo_id, repo_type=repo_type, branch=revision, exist_ok=True, token=token
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +431,7 @@ def build_training_arguments(
     use_wandb: bool = True,
     gradient_checkpointing: bool = True,
     bf16: bool | None = None,
+    seed: int = 42,
 ) -> Any:
     """Build ``SFTConfig`` for a QLoRA run with periodic checkpoints."""
     import torch
@@ -444,6 +461,7 @@ def build_training_arguments(
         packing=False,
         report_to="wandb" if use_wandb else "none",
         run_name=run_name,
+        seed=seed,
     )
 
 
@@ -573,10 +591,15 @@ def push_adapter_to_hub(
     tokenizer: Any,
     *,
     repo_id: str | None = None,
+    revision: str | None = None,
     private: bool = False,
     commit_message: str = "Upload QLoRA adapter for resume parsing",
 ) -> str:
-    """Create/update the model repo and upload the adapter and tokenizer."""
+    """Create/update the model repo and upload the adapter and tokenizer.
+
+    ``revision`` (for example ``trained-2000``) uploads to that branch so each
+    training batch is versioned by how much was trained.
+    """
     from huggingface_hub import create_repo
 
     token = _hf_token()
@@ -584,15 +607,18 @@ def push_adapter_to_hub(
         raise RuntimeError("HF_TOKEN is required to push a model.")
     resolved = model_repo_id(repo_id)
     create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
-    model.push_to_hub(resolved, token=token, commit_message=commit_message)
-    tokenizer.push_to_hub(resolved, token=token, commit_message=commit_message)
-    return f"https://huggingface.co/{resolved}"
+    _ensure_revision(resolved, revision, "model", token)
+    model.push_to_hub(resolved, revision=revision, token=token, commit_message=commit_message)
+    tokenizer.push_to_hub(resolved, revision=revision, token=token, commit_message=commit_message)
+    suffix = f"/tree/{revision}" if revision else ""
+    return f"https://huggingface.co/{resolved}{suffix}"
 
 
 def push_checkpoint_folder(
     folder: Path | str,
     *,
     repo_id: str | None = None,
+    revision: str | None = None,
     path_in_repo: str | None = None,
     private: bool = False,
     commit_message: str | None = None,
@@ -606,15 +632,18 @@ def push_checkpoint_folder(
     resolved = model_repo_id(repo_id)
     folder = Path(folder)
     create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
+    _ensure_revision(resolved, revision, "model", token)
     upload_folder(
         folder_path=str(folder),
         repo_id=resolved,
         repo_type="model",
+        revision=revision,
         path_in_repo=path_in_repo or folder.name,
         commit_message=commit_message or f"Upload checkpoint {folder.name}",
         token=token,
     )
-    return f"https://huggingface.co/{resolved}"
+    suffix = f"/tree/{revision}" if revision else ""
+    return f"https://huggingface.co/{resolved}{suffix}"
 
 
 def free_memory() -> None:
@@ -638,12 +667,16 @@ __all__ = [
     "DEFAULT_MAX_SEQ_LENGTH",
     "DEFAULT_MODEL_ID",
     "DEFAULT_TARGET_MODULES",
+    "HF_DATASET_REPO",
+    "HF_MODEL_REPO",
+    "HF_USERNAME",
     "MODELS_DIR",
     "SPLIT_FILENAMES",
     "build_datasets",
     "build_lora_config",
     "build_training_arguments",
     "build_training_examples",
+    "checkpoint_revision",
     "configure_wandb_env",
     "dataset_repo_id",
     "download_curated_splits",
