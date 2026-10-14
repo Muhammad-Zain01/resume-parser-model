@@ -30,6 +30,8 @@ import shutil
 import warnings
 from collections import Counter
 from pathlib import Path
+from pathlib import PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Any, Callable
 
 from dotenv import load_dotenv
@@ -673,6 +675,7 @@ def train(
     lora_config: Any,
     training_args: Any,
     resume_from_checkpoint: str | bool | None = None,
+    callbacks: list[Any] | None = None,
 ) -> Any:
     """Run Supervised Fine-Tuning and return the trainer."""
     from trl import SFTTrainer
@@ -706,6 +709,8 @@ def train(
         "eval_dataset": eval_dataset,
         "peft_config": lora_config,
     }
+    if callbacks:
+        common["callbacks"] = callbacks
     trainer = SFTTrainer(processing_class=tokenizer, **common)
     # Recent TRL versions cast quantized-model adapters to bf16 even when the
     # run uses fp16 (e.g. on a T4). Keep FP32 adapter gradients for FP16 scaling;
@@ -864,7 +869,49 @@ def push_checkpoint_folder(
     private: bool = False,
     commit_message: str | None = None,
 ) -> str:
-    """Upload a saved checkpoint folder (adapter + optimizer state) to the Hub."""
+    """Upload a complete checkpoint and return its immutable commit URL."""
+    return _upload_checkpoint(
+        folder, repo_id=repo_id, revision=revision,
+        path_in_repo=path_in_repo or Path(folder).name,
+        private=private, commit_message=commit_message,
+    )["commit_url"]
+
+
+_CHECKPOINT_FILES = [
+    "adapter_config.json", "adapter_model*.safetensors", "adapter_model*.bin",
+    "optimizer.pt", "scheduler.pt", "trainer_state.json", "rng_state*.pth",
+    "scaler.pt", "training_args.bin", "run_manifest.json",
+    "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+    "added_tokens.json", "vocab.json", "merges.txt", "chat_template.jinja",
+    "chat_templates/*.jinja",
+]
+
+
+def _checkpoint_step(folder: Path) -> int:
+    required = ("adapter_config.json", "optimizer.pt", "scheduler.pt", "trainer_state.json")
+    if any(not (folder / name).is_file() for name in required):
+        raise ValueError("Expected a complete QLoRA Trainer checkpoint with optimizer/scheduler state.")
+    if not list(folder.glob("adapter_model*.safetensors")) and not list(folder.glob("adapter_model*.bin")):
+        raise ValueError("Checkpoint adapter weights are missing.")
+    if not list(folder.glob("rng_state*.pth")):
+        raise ValueError("Checkpoint RNG state is missing.")
+    step = json.loads((folder / "trainer_state.json").read_text(encoding="utf-8"))["global_step"]
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise ValueError("Checkpoint global_step must be a non-negative integer.")
+    return step
+
+
+def _checkpoint_path(path: str) -> str:
+    value = PurePosixPath(path)
+    if not path or value.is_absolute() or any(p in {".", ".."} for p in path.split("/")) or "\\" in path:
+        raise ValueError("Use a non-empty relative Hub checkpoint directory.")
+    return str(value)
+
+
+def _upload_checkpoint(
+    folder: Path | str, *, repo_id: str | None, revision: str | None,
+    path_in_repo: str, private: bool, commit_message: str | None = None,
+) -> dict[str, Any]:
     from huggingface_hub import create_repo, upload_folder
 
     token = _hf_token()
@@ -872,19 +919,129 @@ def push_checkpoint_folder(
         raise RuntimeError("HF_TOKEN is required to push checkpoints.")
     resolved = model_repo_id(repo_id)
     folder = Path(folder)
+    step = _checkpoint_step(folder)
+    path_in_repo = _checkpoint_path(path_in_repo)
     create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
     _ensure_revision(resolved, revision, "model", token)
-    upload_folder(
+    commit = upload_folder(
         folder_path=str(folder),
         repo_id=resolved,
         repo_type="model",
         revision=revision,
-        path_in_repo=path_in_repo or folder.name,
-        commit_message=commit_message or f"Upload checkpoint {folder.name}",
+        path_in_repo=path_in_repo,
+        # Replacement is scoped to this checkpoint directory. Older snapshots
+        # remain available by commit SHA; stale scaler/tokenizer files are removed.
+        delete_patterns=["*"],
+        allow_patterns=_CHECKPOINT_FILES,
+        commit_message=commit_message or f"Save resumable checkpoint at step {step}",
         token=token,
+        run_as_future=False,
     )
-    suffix = f"/tree/{revision}" if revision else ""
-    return f"https://huggingface.co/{resolved}{suffix}"
+    return {"repo_id": resolved, "revision": revision or "main", "path_in_repo": path_in_repo,
+            "global_step": step, "commit_sha": commit.oid, "commit_url": str(commit.commit_url)}
+
+
+def build_hub_checkpoint_callback(
+    *, repo_id: str | None = None, revision: str = "main",
+    path_in_repo: str = "checkpoint", private: bool = False,
+) -> Any:
+    """Synchronously commit every saved checkpoint, preserving SHA-based recovery.
+
+    Local files are staging only. Upload failures stop training so the latest
+    confirmed durable state is explicit. This workflow targets one CUDA device.
+    """
+    from huggingface_hub import HfApi, create_repo
+    from transformers import TrainerCallback
+
+    token = _hf_token()
+    if not token:
+        raise RuntimeError("HF_TOKEN with write access is required for Hugging Face checkpoints.")
+    resolved = model_repo_id(repo_id)
+    path_in_repo = _checkpoint_path(path_in_repo)
+    create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
+    HfApi().auth_check(repo_id=resolved, repo_type="model", write=True, token=token)
+    _ensure_revision(resolved, revision, "model", token)
+
+    class HubCheckpointCallback(TrainerCallback):
+        def __init__(self) -> None:
+            self.uploads: list[dict[str, Any]] = []
+
+        def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            if not state.is_world_process_zero:
+                return control
+            root = Path(args.output_dir)
+            checkpoint = root / f"checkpoint-{state.global_step}"
+            manifest = root / "run_manifest.json"
+            if not manifest.is_file():
+                raise RuntimeError("Write run_manifest.json before training so Hub checkpoints can be recovered.")
+            shutil.copyfile(manifest, checkpoint / manifest.name)
+            try:
+                uploaded = _upload_checkpoint(
+                    checkpoint, repo_id=resolved, revision=revision,
+                    path_in_repo=path_in_repo, private=private,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"Hugging Face checkpoint upload failed at step {state.global_step}. "
+                    f"Training stopped; the local checkpoint is still at {checkpoint}."
+                ) from error
+            self.uploads.append(uploaded)
+            with (root / "checkpoint_commits.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(uploaded) + "\n")
+            print(f"Checkpoint step {uploaded['global_step']} saved: {uploaded['commit_url']}")
+            print(f"Recovery commit SHA: {uploaded['commit_sha']}")
+            return control
+
+    return HubCheckpointCallback()
+
+
+def download_checkpoint_from_hub(
+    output_dir: Path | str, *, revision: str, repo_id: str | None = None,
+    path_in_repo: str = "checkpoint",
+) -> Path:
+    """Restore complete state and its manifest from a branch or full commit SHA."""
+    from huggingface_hub import HfApi, snapshot_download
+
+    if not revision or not revision.strip():
+        raise ValueError("Provide a full checkpoint commit SHA or experiment branch.")
+    resolved = model_repo_id(repo_id)
+    path_in_repo = _checkpoint_path(path_in_repo)
+    token = _hf_token()
+    # Resolve a branch only once, then pin the entire download to its immutable SHA.
+    sha = HfApi().model_info(repo_id=resolved, revision=revision.strip(), token=token).sha
+    if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+        raise RuntimeError("The Hub did not return a full checkpoint commit SHA.")
+    snapshot = Path(snapshot_download(
+        repo_id=resolved, repo_type="model", revision=sha,
+        allow_patterns=[f"{path_in_repo}/{pattern}" for pattern in _CHECKPOINT_FILES], token=token,
+    ))
+    source = snapshot / path_in_repo
+    step = _checkpoint_step(source)
+    manifest = source / "run_manifest.json"
+    if not manifest.is_file():
+        raise ValueError("This Hub checkpoint has no run manifest; it cannot use notebook recovery validation.")
+    root = Path(output_dir)
+    root_manifest = root / manifest.name
+    if root_manifest.exists() and root_manifest.read_bytes() != manifest.read_bytes():
+        raise ValueError("The local run manifest differs from this Hub checkpoint; use a fresh output directory.")
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / f"checkpoint-{step}"
+    receipt = {"repo_id": resolved, "commit_sha": sha, "path_in_repo": path_in_repo}
+    if destination.exists():
+        existing = destination / "hub_checkpoint.json"
+        if not existing.is_file() or json.loads(existing.read_text()) != receipt:
+            raise ValueError("A different local checkpoint exists at this step; use a fresh output directory.")
+        _checkpoint_step(destination)
+    else:
+        # Stage a complete copy before exposing the restored checkpoint path.
+        with TemporaryDirectory(dir=root, prefix=".hub-restore-") as staging:
+            staged = Path(staging) / destination.name
+            shutil.copytree(source, staged)
+            (staged / "hub_checkpoint.json").write_text(json.dumps(receipt), encoding="utf-8")
+            staged.rename(destination)
+    shutil.copyfile(manifest, root_manifest)
+    print(f"Restored checkpoint step {step} from commit {sha}")
+    return destination
 
 
 def free_memory() -> None:
@@ -917,11 +1074,13 @@ __all__ = [
     "build_lora_config",
     "build_training_arguments",
     "build_training_examples",
+    "build_hub_checkpoint_callback",
     "checkpoint_revision",
     "configure_wandb_env",
     "dataset_repo_id",
     "download_curated_splits",
     "download_split",
+    "download_checkpoint_from_hub",
     "evaluate_records",
     "free_memory",
     "filter_records_by_length",
