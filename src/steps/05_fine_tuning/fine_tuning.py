@@ -559,6 +559,8 @@ def load_model_and_tokenizer(
         max_seq_length=max_seq_length,
         dtype=torch.float16,
         load_in_4bit=True,
+        # One complete QLoRA replica per DDP rank; never shard it across ranks.
+        device_map={"": torch.cuda.current_device()},
         token=_hf_token(),
     )
     if not tokenizer.chat_template or tokenizer.eos_token_id is None:
@@ -641,7 +643,7 @@ def configure_wandb_env(
 def build_training_arguments(
     output_dir: Path | str,
     *,
-    epochs: float = 2.0,
+    epochs: float = 1.0,
     learning_rate: float = 2e-4,
     per_device_batch_size: int = 1,
     gradient_accumulation_steps: int = 16,
@@ -660,9 +662,14 @@ def build_training_arguments(
     per_device_eval_batch_size: int = 1,
     optim: str = "paged_adamw_8bit",
     evaluate_during_training: bool = False,
+    eval_strategy: str = "steps",
     max_steps: int = -1,
 ) -> Any:
-    """Build ``SFTConfig`` for a QLoRA run with periodic checkpoints."""
+    """Build ``SFTConfig`` with checkpoints and optional held-out loss checks.
+
+    Enabled validation runs before training and on the chosen steps/epoch
+    schedule. Validation uses forward passes only, without weight updates.
+    """
     from unsloth import FastLanguageModel  # Patch before importing TRL.
     import torch
     from trl import SFTConfig
@@ -671,6 +678,8 @@ def build_training_arguments(
         raise ValueError("Use positive epochs/learning_rate and warmup_ratio in [0, 1).")
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps == 0 or max_steps < -1:
         raise ValueError("max_steps must be -1 (use epochs) or a positive integer.")
+    if eval_strategy not in {"steps", "epoch"}:
+        raise ValueError("eval_strategy must be 'steps' or 'epoch'.")
     for name, value in {
         "per_device_batch_size": per_device_batch_size,
         "per_device_eval_batch_size": per_device_eval_batch_size,
@@ -704,12 +713,15 @@ def build_training_arguments(
         save_strategy="steps",
         save_steps=save_steps,
         save_total_limit=save_total_limit,
-        eval_strategy="steps" if evaluate_during_training else "no",
+        eval_strategy=eval_strategy if evaluate_during_training else "no",
+        eval_on_start=evaluate_during_training,
         eval_steps=eval_steps,
         bf16=False,
         fp16=True,
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
+        ddp_find_unused_parameters=False,
+        ddp_timeout=7200,
         max_length=max_seq_length,
         completion_only_loss=True,
         prediction_loss_only=True,
@@ -972,6 +984,15 @@ def _checkpoint_step(folder: Path) -> int:
         raise ValueError("Checkpoint adapter weights are missing.")
     if not list(folder.glob("rng_state*.pth")):
         raise ValueError("Checkpoint RNG state is missing.")
+    manifest = folder / "run_manifest.json"
+    if not manifest.is_file():
+        manifest = folder.parent / "run_manifest.json"
+    if manifest.is_file():
+        gpu_count = json.loads(manifest.read_text(encoding="utf-8")).get("gpu_count", 1)
+        if gpu_count > 1 and any(
+            not (folder / f"rng_state_{rank}.pth").is_file() for rank in range(gpu_count)
+        ):
+            raise ValueError("Distributed checkpoint is missing RNG state for one or more GPU ranks.")
     step = json.loads((folder / "trainer_state.json").read_text(encoding="utf-8"))["global_step"]
     if isinstance(step, bool) or not isinstance(step, int) or step < 0:
         raise ValueError("Checkpoint global_step must be a non-negative integer.")
@@ -1026,7 +1047,8 @@ def build_hub_checkpoint_callback(
     """Synchronously commit every saved checkpoint, preserving SHA-based recovery.
 
     Local files are staging only. Upload failures stop training so the latest
-    confirmed durable state is explicit. This workflow targets one CUDA device.
+    confirmed durable state is explicit. In DDP, all ranks synchronize saves
+    so every rank's RNG state is present before the upload.
     With ``step_revisions``, each saved SHA also gets a step-named branch;
     the run branch retains the complete checkpoint commit history.
     """
@@ -1047,8 +1069,22 @@ def build_hub_checkpoint_callback(
             self.uploads: list[dict[str, Any]] = []
 
         def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+            import torch.distributed as dist
+
+            distributed = dist.is_available() and dist.is_initialized()
+            if distributed:
+                dist.barrier()
             if not state.is_world_process_zero:
+                if distributed:
+                    dist.barrier()
                 return control
+            try:
+                return self._upload(args, state, control)
+            finally:
+                if distributed:
+                    dist.barrier()
+
+        def _upload(self, args: Any, state: Any, control: Any) -> Any:
             root = Path(args.output_dir)
             checkpoint = root / f"checkpoint-{state.global_step}"
             manifest = root / "run_manifest.json"
