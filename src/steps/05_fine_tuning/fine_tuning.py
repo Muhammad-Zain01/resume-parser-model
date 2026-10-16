@@ -63,7 +63,7 @@ CURATED_DIR = DATA_DIR / "curated"
 # Use your own username please.
 HF_USERNAME = "md-zain"
 HF_DATASET_REPO = f"{HF_USERNAME}/resume-parser-dataset"
-HF_MODEL_REPO = f"{HF_USERNAME}/resume-parser-qwen2.5-3b"
+HF_MODEL_REPO = f"{HF_USERNAME}/resume-parser"
 
 DEFAULT_MODEL_ID = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
 DEFAULT_MAX_SEQ_LENGTH = 1024
@@ -1021,11 +1021,14 @@ def _upload_checkpoint(
 def build_hub_checkpoint_callback(
     *, repo_id: str | None = None, revision: str = "main",
     path_in_repo: str = "checkpoint", private: bool = False,
+    step_revisions: bool = False,
 ) -> Any:
     """Synchronously commit every saved checkpoint, preserving SHA-based recovery.
 
     Local files are staging only. Upload failures stop training so the latest
     confirmed durable state is explicit. This workflow targets one CUDA device.
+    With ``step_revisions``, each saved SHA also gets a step-named branch;
+    the run branch retains the complete checkpoint commit history.
     """
     from huggingface_hub import HfApi, create_repo
     from transformers import TrainerCallback
@@ -1062,11 +1065,30 @@ def build_hub_checkpoint_callback(
                     f"Hugging Face checkpoint upload failed at step {state.global_step}. "
                     f"Training stopped; the local checkpoint is still at {checkpoint}."
                 ) from error
-            self.uploads.append(uploaded)
-            with (root / "checkpoint_commits.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(uploaded) + "\n")
-            print(f"Checkpoint step {uploaded['global_step']} saved: {uploaded['commit_url']}")
-            print(f"Recovery commit SHA: {uploaded['commit_sha']}")
+            try:
+                if step_revisions:
+                    step_revision = f"checkpoint-step-{uploaded['global_step']}-{revision}"
+                    api = HfApi()
+                    api.create_branch(
+                        repo_id=resolved, repo_type="model", branch=step_revision,
+                        revision=uploaded["commit_sha"], exist_ok=True, token=token,
+                    )
+                    if api.model_info(repo_id=resolved, revision=step_revision, token=token).sha != uploaded["commit_sha"]:
+                        raise ValueError("The step-named branch already points to a different checkpoint SHA.")
+                    uploaded["step_revision"] = step_revision
+                    print(f"Step revision: {step_revision}")
+            except Exception as error:
+                raise RuntimeError(
+                    f"Checkpoint is committed at {uploaded['commit_sha']}, but its step-named branch could not be created. "
+                    "Resume using that commit SHA; its checkpoint remains saved."
+                ) from error
+            finally:
+                # Keep the successful checkpoint receipt even if step-branch naming fails.
+                self.uploads.append(uploaded)
+                with (root / "checkpoint_commits.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(uploaded) + "\n")
+                print(f"Checkpoint step {uploaded['global_step']} saved: {uploaded['commit_url']}")
+                print(f"Recovery commit SHA: {uploaded['commit_sha']}")
             return control
 
     return HubCheckpointCallback()
