@@ -18,6 +18,16 @@ def main() -> None:
     parser.add_argument("--job", type=Path, required=True)
     args = parser.parse_args()
     job = json.loads(args.job.read_text(encoding="utf-8"))
+    try:
+        _run(job)
+    finally:
+        # Startup failures can happen before W&B/training begins (e.g. Hub 500).
+        distributed = sys.modules.get("torch.distributed")
+        if distributed is not None and distributed.is_initialized():
+            distributed.destroy_process_group()
+
+
+def _run(job: dict) -> None:
 
     # Unsloth must patch the training stack before Transformers/TRL imports.
     from unsloth import FastLanguageModel  # noqa: F401
@@ -145,8 +155,6 @@ def main() -> None:
     finally:
         if run is not None:
             run.finish(exit_code=0 if succeeded else 1)
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

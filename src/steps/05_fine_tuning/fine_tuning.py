@@ -26,6 +26,7 @@ import random
 import re
 import sys
 import shutil
+import time
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -63,7 +64,7 @@ CURATED_DIR = DATA_DIR / "curated"
 # Use your own username please.
 HF_USERNAME = "md-zain"
 HF_DATASET_REPO = f"{HF_USERNAME}/resume-parser-dataset"
-HF_MODEL_REPO = f"{HF_USERNAME}/resume-parser"
+HF_MODEL_REPO = f"{HF_USERNAME}/resume-parser-v2"
 
 DEFAULT_MODEL_ID = "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
 DEFAULT_MAX_SEQ_LENGTH = 1024
@@ -147,14 +148,37 @@ def checkpoint_revision(
     return re.sub(r"[^0-9A-Za-z_-]+", "-", revision).strip("-_") or "trained"
 
 
+def _retry_hub_setup(operation: str, action: Callable[[], Any]) -> Any:
+    """Retry idempotent Hub setup on transient HTTP errors, never auth errors."""
+    from huggingface_hub.errors import HfHubHTTPError
+
+    for attempt in range(5):
+        try:
+            return action()
+        except HfHubHTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+            if status not in {429, 500, 502, 503, 504} or attempt == 4:
+                raise
+            delay = 2 ** (attempt + 1)
+            warnings.warn(
+                f"Hugging Face {operation} returned HTTP {status}; "
+                f"retrying in {delay}s (attempt {attempt + 2}/5).",
+                stacklevel=2,
+            )
+            time.sleep(delay)
+
+
 def _ensure_revision(repo_id: str, revision: str | None, repo_type: str, token: str) -> None:
     """Create the target branch/revision on the Hub if it does not exist yet."""
     if not revision or revision == "main":
         return
     from huggingface_hub import HfApi
 
-    HfApi().create_branch(
-        repo_id=repo_id, repo_type=repo_type, branch=revision, exist_ok=True, token=token
+    _retry_hub_setup(
+        "branch creation",
+        lambda: HfApi().create_branch(
+            repo_id=repo_id, repo_type=repo_type, branch=revision, exist_ok=True, token=token
+        ),
     )
 
 
@@ -944,7 +968,10 @@ def push_adapter_to_hub(
     if not token:
         raise RuntimeError("HF_TOKEN is required to push a model.")
     resolved = model_repo_id(repo_id)
-    create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
+    _retry_hub_setup(
+        "repository creation",
+        lambda: create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token),
+    )
     _ensure_revision(resolved, revision, "model", token)
     model.push_to_hub(resolved, revision=revision, token=token, commit_message=commit_message)
     tokenizer.push_to_hub(resolved, revision=revision, token=token, commit_message=commit_message)
@@ -1022,7 +1049,10 @@ def _upload_checkpoint(
     folder = Path(folder)
     step = _checkpoint_step(folder)
     path_in_repo = _checkpoint_path(path_in_repo)
-    create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
+    _retry_hub_setup(
+        "repository creation",
+        lambda: create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token),
+    )
     _ensure_revision(resolved, revision, "model", token)
     commit = upload_folder(
         folder_path=str(folder),
@@ -1057,15 +1087,24 @@ def build_hub_checkpoint_callback(
     """
     from huggingface_hub import HfApi, create_repo
     from transformers import TrainerCallback
+    import torch.distributed as dist
 
     token = _hf_token()
     if not token:
         raise RuntimeError("HF_TOKEN with write access is required for Hugging Face checkpoints.")
     resolved = model_repo_id(repo_id)
     path_in_repo = _checkpoint_path(path_in_repo)
-    create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token)
-    HfApi().auth_check(repo_id=resolved, repo_type="model", write=True, token=token)
-    _ensure_revision(resolved, revision, "model", token)
+    rank = dist.get_rank() if dist.is_initialized() else int(os.getenv("RANK", "0"))
+    if rank == 0:
+        _retry_hub_setup(
+            "repository creation",
+            lambda: create_repo(resolved, repo_type="model", private=private, exist_ok=True, token=token),
+        )
+        _retry_hub_setup(
+            "repository access check",
+            lambda: HfApi().auth_check(repo_id=resolved, repo_type="model", write=True, token=token),
+        )
+        _ensure_revision(resolved, revision, "model", token)
 
     class HubCheckpointCallback(TrainerCallback):
         def __init__(self) -> None:
@@ -1108,11 +1147,18 @@ def build_hub_checkpoint_callback(
                 if step_revisions:
                     step_revision = f"checkpoint-step-{uploaded['global_step']}-{revision}"
                     api = HfApi()
-                    api.create_branch(
-                        repo_id=resolved, repo_type="model", branch=step_revision,
-                        revision=uploaded["commit_sha"], exist_ok=True, token=token,
+                    _retry_hub_setup(
+                        "checkpoint branch creation",
+                        lambda: api.create_branch(
+                            repo_id=resolved, repo_type="model", branch=step_revision,
+                            revision=uploaded["commit_sha"], exist_ok=True, token=token,
+                        ),
                     )
-                    if api.model_info(repo_id=resolved, revision=step_revision, token=token).sha != uploaded["commit_sha"]:
+                    branch_info = _retry_hub_setup(
+                        "checkpoint branch verification",
+                        lambda: api.model_info(repo_id=resolved, revision=step_revision, token=token),
+                    )
+                    if branch_info.sha != uploaded["commit_sha"]:
                         raise ValueError("The step-named branch already points to a different checkpoint SHA.")
                     uploaded["step_revision"] = step_revision
                     print(f"Step revision: {step_revision}")
