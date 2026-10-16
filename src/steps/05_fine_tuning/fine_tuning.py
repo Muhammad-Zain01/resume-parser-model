@@ -163,19 +163,22 @@ def _ensure_revision(repo_id: str, revision: str | None, repo_type: str, token: 
 # ---------------------------------------------------------------------------
 
 
-def download_split(split: str, *, curated_dir: Path | str = CURATED_DIR, force: bool = False) -> Path:
+def download_split(
+    split: str, *, curated_dir: Path | str = CURATED_DIR, force: bool = False,
+    repo_id: str | None = None,
+) -> Path:
     """Download one curated split from the dataset repo if it is missing."""
     filename = SPLIT_FILENAMES.get(split)
     if filename is None:
         raise ValueError(f"Unknown split {split!r}; expected one of {sorted(SPLIT_FILENAMES)}.")
     destination = Path(curated_dir) / filename
-    if destination.is_file() and not force and not os.getenv("HF_DATASET_REVISION"):
+    if destination.is_file() and not force and repo_id is None and not os.getenv("HF_DATASET_REVISION"):
         return destination
 
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
-    repo_id = dataset_repo_id()
+    repo_id = dataset_repo_id(repo_id)
     revision = (os.getenv("HF_DATASET_REVISION") or "main").strip() or "main"
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -208,9 +211,13 @@ def download_curated_splits(
     splits: tuple[str, ...] = DEFAULT_SPLITS,
     curated_dir: Path | str = CURATED_DIR,
     force: bool = False,
+    repo_id: str | None = None,
 ) -> dict[str, Path]:
     """Download the curated splits needed for training and validation."""
-    return {name: download_split(name, curated_dir=curated_dir, force=force) for name in splits}
+    return {
+        name: download_split(name, curated_dir=curated_dir, force=force, repo_id=repo_id)
+        for name in splits
+    }
 
 
 def load_records(path: Path | str) -> list[dict[str, Any]]:
@@ -380,7 +387,7 @@ def filter_records_by_length(
         raise ValueError(
             f"Only {len(kept)}/{len(records)} complete examples fit {max_length} tokens "
             f"(minimum required: {min_samples}, shortest example: {shortest}). "
-            "Use the compact prompt or choose a larger context budget in Colab; JSON is not truncated."
+            "Use the compact prompt or choose a larger context budget; JSON is not truncated."
         )
     return kept, report
 
@@ -534,7 +541,7 @@ def load_model_and_tokenizer(
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
     compute_dtype: Any | None = None,
 ) -> tuple[Any, Any]:
-    """Load only a 4-bit Unsloth model; use FP16 for the Colab T4 profile."""
+    """Load only a 4-bit Unsloth model; use FP16 for the T4 profile."""
     # Unsloth must be imported before Transformers, PEFT, or TRL.
     from unsloth import FastLanguageModel
     import torch
@@ -542,7 +549,7 @@ def load_model_and_tokenizer(
     if not load_in_4bit:
         raise ValueError("The T4 workflow requires load_in_4bit=True; full-precision loading is disabled.")
     if not torch.cuda.is_available():
-        raise RuntimeError("Select Runtime > Change runtime type > T4 GPU in Colab.")
+        raise RuntimeError("Enable a CUDA GPU in the notebook accelerator settings.")
     if max_seq_length < 1:
         raise ValueError("max_seq_length must be positive.")
     if compute_dtype is not None and compute_dtype != torch.float16:
@@ -653,6 +660,7 @@ def build_training_arguments(
     per_device_eval_batch_size: int = 1,
     optim: str = "paged_adamw_8bit",
     evaluate_during_training: bool = False,
+    max_steps: int = -1,
 ) -> Any:
     """Build ``SFTConfig`` for a QLoRA run with periodic checkpoints."""
     from unsloth import FastLanguageModel  # Patch before importing TRL.
@@ -661,6 +669,8 @@ def build_training_arguments(
 
     if epochs <= 0 or learning_rate <= 0 or not 0 <= warmup_ratio < 1:
         raise ValueError("Use positive epochs/learning_rate and warmup_ratio in [0, 1).")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps == 0 or max_steps < -1:
+        raise ValueError("max_steps must be -1 (use epochs) or a positive integer.")
     for name, value in {
         "per_device_batch_size": per_device_batch_size,
         "per_device_eval_batch_size": per_device_eval_batch_size,
@@ -671,17 +681,18 @@ def build_training_arguments(
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer.")
     if not torch.cuda.is_available():
-        raise RuntimeError("This training profile requires a CUDA GPU in Colab.")
+        raise RuntimeError("This training profile requires a CUDA GPU.")
     if bf16:
         raise ValueError("bf16 is disabled for this T4 profile; use fp16.")
     fields = getattr(SFTConfig, "__dataclass_fields__", None) or inspect.signature(SFTConfig).parameters
     if "max_length" not in fields or "completion_only_loss" not in fields:
-        raise RuntimeError("Unsupported TRL version. Rerun the notebook installation cell in a fresh Colab runtime.")
+        raise RuntimeError("Unsupported TRL version. Rerun the notebook installation cell in a fresh session.")
     warmup = {"warmup_ratio": warmup_ratio} if "warmup_ratio" in fields else {"warmup_steps": warmup_ratio}
 
     return SFTConfig(
         output_dir=str(output_dir),
         num_train_epochs=epochs,
+        max_steps=max_steps,
         per_device_train_batch_size=per_device_batch_size,
         per_device_eval_batch_size=per_device_eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -766,7 +777,7 @@ def train(
         for parameter in trainer.model.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.to(torch.float32)
-    # Verify masking in Colab after TRL preprocessing, before any optimizer step.
+    # Verify masking after TRL preprocessing, before any optimizer step.
     batch = trainer.data_collator([trainer.train_dataset[0]])
     labels = batch["labels"]
     if not torch.any(labels != -100).item() or not torch.any(labels == -100).item():
