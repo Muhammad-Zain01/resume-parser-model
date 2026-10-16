@@ -366,6 +366,7 @@ def filter_records_by_length(
         raise ValueError("Use a positive max_length and policy='error' or 'drop'.")
     kept = []
     longest = 0
+    longest_kept = 0
     shortest = None
     for record in records:
         example = build_training_examples([record], prompt_fn=prompt_fn)[0]
@@ -374,8 +375,10 @@ def filter_records_by_length(
         shortest = length if shortest is None else min(shortest, length)
         if length <= max_length:
             kept.append(record)
+            longest_kept = max(longest_kept, length)
     report = {"input_rows": len(records), "over_max_length": len(records) - len(kept),
               "kept_rows": len(kept), "min": shortest, "max": longest,
+              "max_kept_length": longest_kept,
               "retained_fraction": len(kept) / len(records) if records else 0,
               "max_length": max_length}
     if report["over_max_length"] and policy == "error":
