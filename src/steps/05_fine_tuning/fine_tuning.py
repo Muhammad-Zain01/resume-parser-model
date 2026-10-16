@@ -676,7 +676,7 @@ def build_training_arguments(
         raise ValueError("bf16 is disabled for this T4 profile; use fp16.")
     fields = getattr(SFTConfig, "__dataclass_fields__", None) or inspect.signature(SFTConfig).parameters
     if "max_length" not in fields or "completion_only_loss" not in fields:
-        raise RuntimeError("Unsupported TRL version. Install requirements-colab.txt and restart the Colab runtime.")
+        raise RuntimeError("Unsupported TRL version. Rerun the notebook installation cell in a fresh Colab runtime.")
     warmup = {"warmup_ratio": warmup_ratio} if "warmup_ratio" in fields else {"warmup_steps": warmup_ratio}
 
     return SFTConfig(
