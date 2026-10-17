@@ -28,6 +28,15 @@ def load_case(path: Path, fingerprint: str) -> dict:
     return saved
 
 
+def selected_indices(job: dict, record_count: int) -> list[int]:
+    """Use original row positions so anonymous case IDs stay stable in samples."""
+    indices = job.get('selected_indices', list(range(record_count)))
+    if (not indices or len(indices) != len(set(indices))
+            or any(type(index) is not int or not 0 <= index < record_count for index in indices)):
+        raise ValueError('Evaluation row selection is invalid.')
+    return indices
+
+
 def make_callback(model, tokenizer, job: dict, fine_tuning, evaluation):
     import torch
     from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList
@@ -110,7 +119,7 @@ def worker(job: dict, rank: int, world_size: int) -> None:
     records = fine_tuning.load_records(job['evaluation_path'])
     output = Path(job['output_dir'])
     pending = []
-    for index in range(rank, len(records), world_size):
+    for index in selected_indices(job, len(records))[rank::world_size]:
         path = output / 'cases' / f'case-{index + 1:05d}.json'
         if path.exists() and load_case(path, job['fingerprint'])['status'] not in RETRYABLE:
             continue
@@ -180,7 +189,7 @@ def worker(job: dict, rank: int, world_size: int) -> None:
     })
 
 
-def summarize(job: dict):
+def summarize(job: dict, *, show: bool = True):
     """Rebuild the existing evaluator report from anonymous per-case score files."""
     import pandas as pd
     sys.path.insert(0, job['project_root'])
@@ -191,8 +200,10 @@ def summarize(job: dict):
     results = []
     table_rows = []
     field_rows = []
-    for index, record in enumerate(records, 1):
-        case = f'case-{index:05d}'
+    indices = selected_indices(job, len(records))
+    for index in indices:
+        record = records[index]
+        case = f'case-{index + 1:05d}'
         path = root / 'cases' / f'{case}.json'
         if not path.exists():
             continue
@@ -215,10 +226,12 @@ def summarize(job: dict):
     if not results:
         raise RuntimeError('No saved evaluation scores are available yet.')
     metrics = evaluation.Evaluator([])._summarize(results)
-    complete = len(results) == len(records)
+    complete = len(results) == len(indices)
     metrics.update({
-        'expected_rows': len(records), 'completed_rows': len(results),
+        'source_rows': len(records), 'expected_rows': len(indices), 'completed_rows': len(results),
         'all_rows_processed': complete,
+        'scope': 'sample' if len(indices) < len(records) else 'full held-out split',
+        'sample_seed': job.get('seed', 42),
         'retryable_error_count': sum(r.status in RETRYABLE for r in results),
         'output_limit_count': sum(bool(r.model_metadata.get('hit_output_limit')) for r in results),
         'json_valid_rate': metrics['json_valid_count'] / len(results),
@@ -239,9 +252,17 @@ def summarize(job: dict):
     ])
     summary.to_csv(root / 'summary.csv', index=False)
     report = evaluation.EvaluationReport(metrics, results, None, [])
-    if complete:
-        charts = evaluation.report_results({'resume-parser — post evaluation': report})
-        charts.save(root / 'charts')
+    scope = f'{len(indices)}-resume sample of {len(records)}' if len(indices) < len(records) else f'all {len(records)} resumes'
+    status = 'complete' if complete else f'partial: {len(results)}/{len(indices)}'
+    charts = evaluation.report_results(
+        {f'resume-parser — post evaluation ({scope}; {status})': report}, show=show,
+    )
+    # Keep a fixed output folder as counts change during a running evaluation.
+    for figure in charts.figures.values():
+        figure.savefig(root / 'performance.png', dpi=160, bbox_inches='tight')
+        if not show:
+            import matplotlib.pyplot as plt
+            plt.close(figure)
     return metrics, summary, table, field_table
 
 
